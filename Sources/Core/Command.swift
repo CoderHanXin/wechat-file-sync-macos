@@ -1,7 +1,7 @@
 import Foundation
 
 enum Command: Equatable {
-    case background, help, selfTest, check, diagnose, listAccounts, configure
+    case application, background, help, selfTest, check, diagnose, listAccounts, configure
     case addAccount(String?), pauseAccount(String), resumeAccount(String), renameAccount(String, String)
     case removeAccount(String), restoreAccount(String), reauthorizeAccount(String), reauthorizeRoot, recoverAccounts
     case restoreLinks(String, String, String)
@@ -13,7 +13,8 @@ enum Command: Equatable {
 
     static func parse(_ arguments: [String]) throws -> Command {
         switch arguments {
-        case []: return .background
+        case []: return .application
+        case ["--background"]: return .background
         case ["--help"], ["-h"]: return .help
         case ["--self-test"]: return .selfTest
         case ["--check"]: return .check
@@ -60,8 +61,9 @@ enum Command: Equatable {
 }
 
 let commandHelp = """
-微信文件同步（M4）
-  无参数                             后台同步所有已启用账号
+微信文件同步
+  无参数                             启动菜单栏与设置窗口
+  --background                      仅运行命令行同步（诊断用途）
   --configure                        首次配置管理根目录并添加账号
   --add-account [--name 备注]          添加微信账号（弹窗授权）
   --list-accounts                    只读列出账号和未完成配置
@@ -83,5 +85,5 @@ let commandHelp = """
   --diagnose                         在授权目录创建临时文件诊断（须停止后台）
   --self-test                        仅使用临时样本自检
 
-修改配置前须先停止后台服务（launchctl bootout）；完成后可重新启动。
+CLI 写入命令前须先退出菜单栏应用或停止后台；设置窗口会按顺序保存配置。
 """

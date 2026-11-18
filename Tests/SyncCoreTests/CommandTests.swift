@@ -3,7 +3,7 @@ import Testing
 
 struct CommandTests {
     @Test func supportedCommandsAreExplicit() throws {
-        #expect(try Command.parse([]) == .background)
+        #expect(try Command.parse([]) == .application)
         #expect(try Command.parse(["--list-accounts"]).readOnly)
         #expect(try Command.parse(["--check"]).readOnly)
         #expect(try Command.parse(["--pause-account", "uuid"]) == .pauseAccount("uuid"))

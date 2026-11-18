@@ -6,9 +6,10 @@ do {
     switch command {
     case .help: print(commandHelp)
     case .selfTest: try selfTest()
+    case .application: runDesktop()
     default:
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("WeChatDownloadSync", isDirectory: true)
+            .appendingPathComponent("WeChatFileSync", isDirectory: true)
         let lock: ProcessLock?
         let content: ContentRepository
         if command.readOnly {

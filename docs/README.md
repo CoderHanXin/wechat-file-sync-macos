@@ -23,6 +23,7 @@ M3 在 `codex/content-dedup-readonly` 提交为 `ce7d43c`，详见 [内容去重
 | [删除与关联恢复决定](decisions/0004-file-association-recovery.md) | 原身份自动恢复、副本指定与预览、清理暂缓及简洁方向 | C10 至 C14 已确认 |
 | [M4 实施方案](file-association-recovery-plan.md) | 最小迁移、清理日志、两条恢复路径及 F01 至 F15 | 简化核心与 CLI 已实现，152 项回归通过 |
 | [简洁性审视](simplicity-review.md) | M1 至 M3 的必要机制、维护负担与 M4 至 M6 范围收缩 | 本轮仅审视和建议 |
+| [最小桌面与部署方案](desktop-app-plan.md) | 独立身份、单窗口、串行会话、登录启动及隔离验收 | M5 已实现，M6 继续推进 |
 | [架构方案](architecture.md) | 说明多账号、内容去重、多条来源、状态保存及界面边界 | 设计草案 |
 | [开发计划](development-plan.md) | 明确开发顺序、阶段验收及文档交付 | 计划草案 |
 | [状态迁移说明](migration.md) | SQLite 导入、书签、诊断与回退边界 | M3 已说明 |
