@@ -11,7 +11,7 @@ final class AccountRepository: SQLiteConnection {
         catch { throw SQLiteStoreError(description: "数据库记录无法解码，原数据已保留") }
     }
 
-    init(url: URL, readOnly: Bool = false,
+    init(url: URL, readOnly: Bool = false, allowContentSchema: Bool = false,
          migrationCheckpoint: ((DatabaseMigrationCheckpoint) throws -> Void)? = nil) throws {
         let existed = FileManager.default.fileExists(atPath: url.path)
         try super.init(url: url, readOnly: readOnly)
@@ -37,7 +37,7 @@ final class AccountRepository: SQLiteConnection {
                 try execute("PRAGMA user_version = 2")
                 try migrationCheckpoint?(.beforeCommit)
             }
-        } else if version != 2 {
+        } else if version != 2 && !(allowContentSchema && version == 3) {
             throw SQLiteStoreError(description: "数据库版本 \(version) 需要迁移或不受支持，原数据库已保留；请停止后台后使用配置命令")
         }
         try rows("PRAGMA quick_check") {

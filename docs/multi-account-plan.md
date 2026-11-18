@@ -180,7 +180,9 @@ SQLite v1 样本也由测试生成，包括书签、planned、linked、conflict 
 
 M2 交付时更新需求、架构、迁移、测试计划、验收记录、README 和 CHANGELOG。完整用户指南可先加入命令行账号管理部分，图形说明留给 M5。补充 `--recover-accounts` 和 `--reauthorize-root`，分别处理未完成配置和原根目录重新授权。本轮按用户指令复核后提交并推送到当前功能分支，不迁移本机真实数据库、不运行真实目录测试。
 
-## 实现说明
+## M2 实现说明
+
+以下为 M2 的实现记录；M3 已在独立分支扩展为 v3，见 [去重与只读方案](content-dedup-readonly-plan.md)。
 
 核心已落在 `AccountRepository`、`AccountStateStore`、`AccountManager`、`SyncCoordinator` 和 `ManagedRootIndex`；应用入口使用 SQLite v2。M1 的 `SQLiteStateStore` 保留用于 v1 校验、迁移和旧回归夹具。配置操作失败后保留计划与本次目录，按身份继续恢复；未记录身份的孤立临时目录不自动接管或删除，以保留用户文件。
 

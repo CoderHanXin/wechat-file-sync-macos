@@ -104,10 +104,11 @@ func rootLease(_ repository: AccountRepository) throws -> DirectoryLease {
 }
 
 @discardableResult
-func recoverAccounts(_ repository: AccountRepository) throws -> Int {
+func recoverAccounts(_ repository: AccountRepository, accountID: String? = nil) throws -> Int {
     let manager = AccountManager(repository: repository)
     var failures = 0
     for setup in try repository.pendingSetups() {
+        if let accountID, setup.account.id != accountID { continue }
         if let account = try repository.accounts().first(where: { $0.id == setup.account.id }), account.removed { continue }
         do {
             let source = try securityScope(bookmark: setup.account.sourceBookmark,

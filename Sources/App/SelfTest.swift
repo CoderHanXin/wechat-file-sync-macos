@@ -112,5 +112,35 @@ func selfTest() throws {
     _ = try coordinator.scan()
     guard linkTarget(secondFile.path) == sharedRoot.appendingPathComponent(second.archiveRelative + "/same.txt").path,
           try repository.accounts().count == 2 else { throw SyncError.message("多账号隔离测试失败") }
-    print("M2 临时样本自测通过")
+    try contentSelfTest()
+    print("M3 临时样本自测通过")
+}
+
+private func contentSelfTest() throws {
+    let temp = try canonicalDirectory(FileManager.default.temporaryDirectory).appendingPathComponent("wechat-content-smoke-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temp) }
+    let source = temp.appendingPathComponent("source")
+    let root = temp.appendingPathComponent("自定义资料")
+    for url in [source, root] { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) }
+    let store = try ContentRepository(url: temp.appendingPathComponent("state.sqlite"))
+    let manager = AccountManager(repository: store.accounts)
+    try manager.configureRoot(root, bookmark: nil)
+    let account = try manager.add(source: source, name: "测试", bookmark: nil)
+    let first = source.appendingPathComponent("first.txt"), second = source.appendingPathComponent("forward.pdf")
+    try Data("content".utf8).write(to: first)
+    try Data("content".utf8).write(to: second)
+    let worker = ContentWorker(store: store, accountID: account.id, settleSeconds: 0)
+    try worker.scan(); try worker.scan()
+    guard let target = linkTarget(first.path), target == linkTarget(second.path),
+          try store.entities(account.id).count == 1, try store.sources(account.id).count == 2,
+          let info = try readFileInfo(target), info.mode & 0o222 == 0 else { throw SyncError.message("M3 去重或只读自测失败：\(worker.report.issues)") }
+    let moved = root.appendingPathComponent("整理后.txt")
+    try FileManager.default.moveItem(atPath: target, toPath: moved.path)
+    try worker.scan()
+    guard linkTarget(first.path) == moved.path, linkTarget(second.path) == moved.path else { throw SyncError.message("多来源改名自测失败") }
+    try FileManager.default.removeItem(at: moved)
+    try worker.scan()
+    guard try store.sources(account.id).count == 2, try store.entities(account.id).first?.status == .missing,
+          fileInfo(first.path) == nil, fileInfo(second.path) == nil else { throw SyncError.message("多来源失联记录自测失败") }
 }

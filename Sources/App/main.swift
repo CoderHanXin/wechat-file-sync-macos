@@ -10,22 +10,23 @@ do {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("WeChatDownloadSync", isDirectory: true)
         let lock: ProcessLock?
-        let repository: AccountRepository
+        let content: ContentRepository
         if command.readOnly {
             lock = nil
-            repository = try AccountRepository(url: support.appendingPathComponent("state.sqlite"), readOnly: true)
+            content = try ContentRepository(url: support.appendingPathComponent("state.sqlite"), readOnly: true)
         } else {
             try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
             lock = try ProcessLock(url: support.appendingPathComponent("sync.lock"))
-            repository = try openAccountRepository(appSupport: support)
+            content = try ContentRepository(url: support.appendingPathComponent("state.sqlite"))
         }
         defer { withExtendedLifetime(lock) {} }
         switch command {
-        case .background: try runBackground(repository: repository)
-        case .listAccounts: try listAccounts(repository)
-        case .check: try checkAccounts(repository, diagnose: false)
-        case .diagnose: try checkAccounts(repository, diagnose: true)
-        default: try runConfiguration(command, repository: repository)
+        case .background: try runBackground(content: content)
+        case .listAccounts: try listAccounts(content.accounts)
+        case .check: try checkAccounts(content.accounts, diagnose: false)
+        case .diagnose: try checkAccounts(content.accounts, diagnose: true)
+        case .setReadOnly, .applyReadOnly, .listFileIssues, .recoverOperations: try runContentCommand(command, store: content)
+        default: try runConfiguration(command, repository: content.accounts)
         }
     }
 } catch {

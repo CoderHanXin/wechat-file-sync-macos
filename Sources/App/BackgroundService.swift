@@ -39,11 +39,12 @@ func checkAccounts(_ repository: AccountRepository, diagnose: Bool) throws {
     guard failures == 0 else { throw SyncError.message("\(failures) 个账号需要检查，其他账号可继续同步") }
 }
 
-func runBackground(repository: AccountRepository) throws {
+func runBackground(content: ContentRepository) throws {
+    let repository = content.accounts
     let root = try rootLease(repository)
     defer { withExtendedLifetime(root) {} }
     try recoverAccounts(repository)
-    let coordinator = SyncCoordinator(repository: repository) { account in
+    let coordinator = ContentCoordinator(store: content) { account in
         let lease = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
         guard try isWeChatFileDirectory(lease.url) else { throw SyncError.message("微信账号目录格式不正确") }
         return lease
@@ -53,6 +54,7 @@ func runBackground(repository: AccountRepository) throws {
             let result = try coordinator.scan()
             for account in result.accounts {
                 if let error = account.error { NSLog("账号 %@ 暂停：%@", account.accountID, error) }
+                for issue in account.report?.issues ?? [] { NSLog("文件 %@ 需要检查：%@", issue.relative, issue.message) }
             }
         } catch let error as SyncError {
             if case .persistence = error { throw error }
