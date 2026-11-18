@@ -16,6 +16,9 @@ struct ScanReport {
 final class SyncWorker {
     let source: URL
     let managedRoot: URL
+    let archiveRelative: String
+    let archiveIdentity: Identity?
+    private var activeIndex: ManagedRootIndex?
     let store: StateStore
     var state: SyncState
     private var lastPersisted: SyncState
@@ -26,9 +29,11 @@ final class SyncWorker {
     let checkpoint: ((TransferCheckpoint) throws -> Void)?
     private(set) var report = ScanReport()
 
-    init(store: StateStore, settleSeconds: TimeInterval = 15, clock: @escaping () -> Date = Date.init,
+    init(store: StateStore, archiveRelative: String = "", archiveIdentity: Identity? = nil, settleSeconds: TimeInterval = 15, clock: @escaping () -> Date = Date.init,
          enumerate: @escaping (URL) throws -> [String: FileInfo] = allFiles,
          checkpoint: ((TransferCheckpoint) throws -> Void)? = nil) throws {
+        self.archiveRelative = archiveRelative
+        self.archiveIdentity = archiveIdentity
         self.store = store
         state = try store.load()
         lastPersisted = state
@@ -79,7 +84,7 @@ final class SyncWorker {
         }
     }
 
-    func scan() throws {
+    func scan(acceptNewFiles: Bool = true, sharedIndex: ManagedRootIndex? = nil) throws {
         report = ScanReport()
         // A previous persistence failure must be repaired before touching any more files.
         try save()
@@ -88,25 +93,14 @@ final class SyncWorker {
             throw SyncError.message("微信目录或管理根目录不可用，同步已暂停")
         }
 
-        var rootIndex: Result<[Identity: [String]], Error>?
-        func movedPath(_ identity: Identity) throws -> String? {
-            if rootIndex == nil {
-                report.managedRootEnumerations += 1
-                rootIndex = Result {
-                    var index: [Identity: [String]] = [:]
-                    for (relative, info) in try enumerate(managedRoot) {
-                        index[info.identity, default: []].append(relative)
-                    }
-                    return index
-                }
-            }
-            let index = try rootIndex?.get() ?? [:]
-            for relative in (index[identity] ?? []).sorted() {
-                let file = try checkedFile(managedRoot, relative: relative)
-                if try readFileInfo(file.path)?.identity == identity { return relative }
-            }
-            return nil
+        let index = sharedIndex ?? ManagedRootIndex(root: managedRoot, enumerate: enumerate)
+        activeIndex = index
+        let previousEnumerations = index.enumerations
+        defer {
+            report.managedRootEnumerations = index.enumerations - previousEnumerations
+            activeIndex = nil
         }
+        func movedPath(_ identity: Identity) throws -> String? { try index.find(identity) }
 
         for relative in state.transfers.keys.sorted() {
             try process(relative) {
@@ -119,6 +113,19 @@ final class SyncWorker {
             }
         }
 
+        // Pausing affects intake only: pending operations and existing links are maintained.
+        if !acceptNewFiles {
+            observations = observations.filter { state.transfers[$0.key]?.phase == .planned }
+            try save()
+            return
+        }
+        do { _ = try intakeDirectory() }
+        catch {
+            observations = observations.filter { state.transfers[$0.key]?.phase == .planned }
+            issue(archiveRelative, String(describing: error))
+            try save()
+            return
+        }
         let current = try enumerate(source)
         let originalIdentities = Set(state.baseline.values)
         for (relative, info) in current {
@@ -143,8 +150,8 @@ final class SyncWorker {
             guard stable(relative, info: info) else { continue }
             try process(relative) {
                 let original = try checkedFile(source, relative: relative)
-                let target = try unusedDestination(managedRoot, name: original.lastPathComponent)
-                state.transfers[relative] = Transfer(destination: target.lastPathComponent,
+                let target = try unusedDestination(intakeDirectory(), name: original.lastPathComponent)
+                state.transfers[relative] = Transfer(destination: try relativePath(target, in: managedRoot),
                     temporary: temporaryPrefix + UUID().uuidString, identity: info.identity,
                     phase: .planned, observedInfo: info)
                 try save()
@@ -157,6 +164,16 @@ final class SyncWorker {
             observations.removeValue(forKey: relative)
         }
         try save()
+    }
+
+    private func intakeDirectory() throws -> URL {
+        if archiveRelative.isEmpty { return managedRoot }
+        let directory = try checkedFile(managedRoot, relative: archiveRelative)
+        guard let expected = archiveIdentity, let info = try readFileInfo(directory.path),
+              info.directory, info.identity == expected else {
+            throw SyncError.message("账号归档目录不可用或已被替换，新文件同步已暂停")
+        }
+        return directory
     }
 
     private func reconcile(_ relative: String, record: Transfer,
@@ -222,9 +239,37 @@ final class SyncWorker {
         let destination = try checkedFile(managedRoot, relative: record.destination)
         let temporary = file.deletingLastPathComponent().appendingPathComponent(record.temporary)
 
-        if linkTarget(file.path) == destination.path {
-            guard let moved = try readFileInfo(destination.path), moved.regular, moved.identity == record.identity else {
-                conflict(relative, "中断后的目标文件缺失或已被替换")
+        if let actualTarget = linkTarget(file.path) {
+            if actualTarget != destination.path {
+                // Recover an interruption after retargeting a completed link, but before
+                // committing its updated planned destination. Never adopt unrelated links.
+                let prefix = managedRoot.path + "/"
+                if actualTarget.hasPrefix(prefix) {
+                    let candidate = String(actualTarget.dropFirst(prefix.count))
+                    let verified = try checkedFile(managedRoot, relative: candidate)
+                    if let info = try readFileInfo(verified.path), info.regular, info.identity == record.identity {
+                        record.destination = candidate
+                        state.transfers[relative] = record
+                        try save()
+                        return
+                    }
+                }
+                conflict(relative, "中断后的微信链接已被修改")
+                return
+            }
+            let moved = try readFileInfo(destination.path)
+            if moved?.regular != true || moved?.identity != record.identity {
+                // Link installation can succeed before its phase commit. User moves in
+                // that window must follow the original identity, including across folders.
+                guard let relocated = try movedPath(record.identity), relocated != record.destination else {
+                    conflict(relative, "中断后的目标文件缺失或已被替换")
+                    return
+                }
+                try updateLink(file, oldTarget: destination, newTarget: checkedFile(managedRoot, relative: relocated))
+                try checkpoint?(.linkUpdated)
+                record.destination = relocated
+                state.transfers[relative] = record
+                try save()
                 return
             }
             if let tempInfo = try readFileInfo(temporary.path) {
@@ -259,11 +304,14 @@ final class SyncWorker {
                 conflict(relative, "微信文件在同步期间发生变化")
                 return
             }
+            if !archiveRelative.isEmpty && record.destination.hasPrefix(archiveRelative + "/") {
+                _ = try intakeDirectory()
+            }
             if try readFileInfo(destination.path) != nil {
                 if linkTarget(temporary.path) == destination.path {
                     try systemCall(unlink(temporary.path), "清理临时链接")
                 }
-                record.destination = try unusedDestination(managedRoot, name: file.lastPathComponent).lastPathComponent
+                record.destination = try relativePath(unusedDestination(intakeDirectory(), name: file.lastPathComponent), in: managedRoot)
                 record.temporary = temporaryPrefix + UUID().uuidString
                 state.transfers[relative] = record
                 try save()
@@ -284,7 +332,7 @@ final class SyncWorker {
             if renamex_np(file.path, destination.path, UInt32(RENAME_EXCL)) != 0 {
                 if errno == EEXIST {
                     try systemCall(unlink(temporary.path), "清理临时链接")
-                    record.destination = try unusedDestination(managedRoot, name: file.lastPathComponent).lastPathComponent
+                    record.destination = try relativePath(unusedDestination(intakeDirectory(), name: file.lastPathComponent), in: managedRoot)
                     record.temporary = temporaryPrefix + UUID().uuidString
                     state.transfers[relative] = record
                     try save()
@@ -292,6 +340,7 @@ final class SyncWorker {
                 }
                 throw SyncError.system("移动归档文件", errno)
             }
+            activeIndex?.register(record.identity, relative: record.destination)
             try checkpoint?(.fileMoved)
             guard try readFileInfo(destination.path)?.identity == record.identity else {
                 // The destination may now be an unrelated replacement. Never move it back blindly.

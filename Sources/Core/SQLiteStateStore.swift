@@ -1,80 +1,52 @@
 import Foundation
 import SQLite3
 
-struct SQLiteStoreError: Error, CustomStringConvertible {
-    let description: String
-}
-
-private enum SQLValue {
-    case text(String), blob(Data), integer(Int64)
-}
-
-/// Single-writer state store. Each save is a transaction; filesystem work has its own durable phases.
-final class SQLiteStateStore: StateStore {
-    private var database: OpaquePointer?
+/// Kept for validating/importing the v1 format and its regression fixtures.
+final class SQLiteStateStore: SQLiteConnection, StateStore {
     private var cached: SyncState?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private let readOnly: Bool
 
-    init(url: URL, readOnly: Bool = false) throws {
-        self.readOnly = readOnly
+    override init(url: URL, readOnly: Bool = false) throws {
         let existed = FileManager.default.fileExists(atPath: url.path)
-        let flags = readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
-        guard sqlite3_open_v2(url.path, &database, flags, nil) == SQLITE_OK else {
-            let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "无法打开数据库"
-            if let database { sqlite3_close(database) }
-            database = nil
-            throw SQLiteStoreError(description: message)
+        try super.init(url: url, readOnly: readOnly)
+        let version = try scalar("PRAGMA user_version")
+        if !existed {
+            try transaction {
+                try execute("""
+                    CREATE TABLE configuration (
+                        id INTEGER PRIMARY KEY CHECK(id = 1),
+                        state_version INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        managed_root TEXT NOT NULL,
+                        source_identity BLOB NOT NULL,
+                        root_identity BLOB NOT NULL
+                    )
+                    """)
+                try execute("CREATE TABLE baseline (relative TEXT PRIMARY KEY, identity BLOB NOT NULL)")
+                try execute("""
+                    CREATE TABLE transfers (
+                        relative TEXT PRIMARY KEY, destination TEXT NOT NULL, temporary TEXT NOT NULL,
+                        identity BLOB NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('planned','linked','conflict')),
+                        observed_info BLOB
+                    )
+                    """)
+                try execute("CREATE TABLE bookmarks (id INTEGER PRIMARY KEY CHECK(id = 1), source BLOB NOT NULL, managed_root BLOB NOT NULL)")
+                try execute("PRAGMA user_version = 1")
+            }
+        } else if version != 1 {
+            throw SQLiteStoreError(description: "不支持的数据库版本 \(version)，原数据库已保留")
         }
-        do {
-            sqlite3_busy_timeout(database, 5000)
-            if !readOnly { try execute("PRAGMA synchronous = FULL") }
-            let version = try scalar("PRAGMA user_version")
-            if !existed {
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-                try transaction {
-                    try execute("""
-                        CREATE TABLE configuration (
-                            id INTEGER PRIMARY KEY CHECK(id = 1),
-                            state_version INTEGER NOT NULL,
-                            source TEXT NOT NULL,
-                            managed_root TEXT NOT NULL,
-                            source_identity BLOB NOT NULL,
-                            root_identity BLOB NOT NULL
-                        )
-                        """)
-                    try execute("CREATE TABLE baseline (relative TEXT PRIMARY KEY, identity BLOB NOT NULL)")
-                    try execute("""
-                        CREATE TABLE transfers (
-                            relative TEXT PRIMARY KEY, destination TEXT NOT NULL, temporary TEXT NOT NULL,
-                            identity BLOB NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('planned','linked','conflict')),
-                            observed_info BLOB
-                        )
-                        """)
-                    try execute("CREATE TABLE bookmarks (id INTEGER PRIMARY KEY CHECK(id = 1), source BLOB NOT NULL, managed_root BLOB NOT NULL)")
-                    try execute("PRAGMA user_version = 1")
-                }
-            } else if version != 1 {
-                throw SQLiteStoreError(description: "不支持的数据库版本 \(version)，原数据库已保留")
-            }
-            let check = try prepare("PRAGMA quick_check")
-            defer { sqlite3_finalize(check) }
-            guard sqlite3_step(check) == SQLITE_ROW, string(check, 0) == "ok" else {
-                throw SQLiteStoreError(description: "数据库完整性检查失败，原数据库已保留")
-            }
-            // Validate all required tables even when the database currently has no configuration.
-            for table in ["configuration", "baseline", "transfers", "bookmarks"] {
-                _ = try scalar("SELECT count(*) FROM \(table)")
-            }
-        } catch {
-            sqlite3_close(database)
-            database = nil
-            throw error
+        let check = try prepare("PRAGMA quick_check")
+        defer { sqlite3_finalize(check) }
+        guard sqlite3_step(check) == SQLITE_ROW, string(check, 0) == "ok" else {
+            throw SQLiteStoreError(description: "数据库完整性检查失败，原数据库已保留")
+        }
+        // Validate all required tables even when the database currently has no configuration.
+        for table in ["configuration", "baseline", "transfers", "bookmarks"] {
+            _ = try scalar("SELECT count(*) FROM \(table)")
         }
     }
-
-    deinit { sqlite3_close(database) }
 
     func loadIfPresent() throws -> SyncState? {
         var loaded: SyncState?
@@ -175,72 +147,4 @@ final class SQLiteStateStore: StateStore {
         cached = state
     }
 
-    private func failure(_ operation: String) -> SQLiteStoreError {
-        SQLiteStoreError(description: "\(operation)：\(String(cString: sqlite3_errmsg(database)))")
-    }
-
-    private func prepare(_ sql: String) throws -> OpaquePointer {
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-            throw failure("准备数据库操作")
-        }
-        return statement
-    }
-
-    private func execute(_ sql: String, _ values: [SQLValue] = []) throws {
-        let statement = try prepare(sql)
-        defer { sqlite3_finalize(statement) }
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        for (offset, value) in values.enumerated() {
-            let index = Int32(offset + 1)
-            let result: Int32
-            switch value {
-            case .text(let text): result = sqlite3_bind_text(statement, index, text, -1, transient)
-            case .integer(let integer): result = sqlite3_bind_int64(statement, index, integer)
-            case .blob(let data):
-                result = data.withUnsafeBytes { sqlite3_bind_blob(statement, index, $0.baseAddress, Int32(data.count), transient) }
-            }
-            guard result == SQLITE_OK else { throw failure("绑定数据库参数") }
-        }
-        guard sqlite3_step(statement) == SQLITE_DONE else { throw failure("提交数据库操作") }
-    }
-
-    private func rows(_ sql: String, body: (OpaquePointer) throws -> Void) throws {
-        let statement = try prepare(sql)
-        defer { sqlite3_finalize(statement) }
-        while true {
-            let result = sqlite3_step(statement)
-            if result == SQLITE_DONE { return }
-            guard result == SQLITE_ROW else { throw failure("读取数据库记录") }
-            try body(statement)
-        }
-    }
-
-    private func scalar(_ sql: String) throws -> Int32 {
-        let statement = try prepare(sql)
-        defer { sqlite3_finalize(statement) }
-        guard sqlite3_step(statement) == SQLITE_ROW else { throw failure("读取数据库版本") }
-        return sqlite3_column_int(statement, 0)
-    }
-
-    private func string(_ statement: OpaquePointer, _ column: Int32) -> String {
-        guard let value = sqlite3_column_text(statement, column) else { return "" }
-        return String(cString: value)
-    }
-
-    private func blob(_ statement: OpaquePointer, _ column: Int32) -> Data {
-        guard let bytes = sqlite3_column_blob(statement, column) else { return Data() }
-        return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, column)))
-    }
-
-    private func transaction(mode: String = "IMMEDIATE", body: () throws -> Void) throws {
-        try execute("BEGIN \(mode) TRANSACTION")
-        do {
-            try body()
-            try execute("COMMIT")
-        } catch {
-            try? execute("ROLLBACK")
-            throw error
-        }
-    }
 }

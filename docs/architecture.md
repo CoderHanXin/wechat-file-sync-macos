@@ -2,6 +2,8 @@
 
 更新日期：2026-11-18。本文为设计草案，行为要求以 [需求与行为规则](requirements.md) 为准。
 
+M2 的按账号存储、归档目录与跟踪范围分离、暂停和调度细化见 [多账号实施方案](multi-account-plan.md)。当前分支已实现 M2；下文内容去重、长期恢复和菜单栏部分仍属 M3 至 M6 设计。
+
 建议继续在当前 fork 分阶段重构。复用现有文件身份识别、同名保护、安全移动、符号链接、进程锁和书签处理实现，并结合新场景重新验证；重新组织账号、内容、多条来源和界面之间的关系。状态存储采用 SQLite，关键决定见 [M0 核心决策](decisions/0001-m0-core-decisions.md)。
 
 ## 模块职责
@@ -80,7 +82,7 @@
 
 ## 状态提交与中断恢复
 
-采用系统 SQLite，通过统一的状态存储接口和事务提交数据。M1 使用版本化的单账号表结构，后续迁移加入多账号与实体来源关系。旧 JSON 成功导入后保留，已有数据库损坏时不自动回退旧状态或重建空库。存储需要覆盖多来源到一实体、删除记录、索引失效和配置升级。
+采用系统 SQLite，通过统一的状态存储接口和事务提交数据。M1 使用单账号表结构，M2 已迁移到按账号隔离的 v2；实体和多来源关系留待 M3。旧 JSON 成功导入后保留，已有数据库损坏时不自动回退旧状态或重建空库。存储需要覆盖多来源到一实体、删除记录、索引失效和配置升级。
 
 添加账号时先验证授权、目录、重复绑定和目标冲突，准备初始基线及状态，再将账号注册为可运行任务。失败或中断不得覆盖其他账号的有效书签和状态。数据库事务不能直接回滚文件系统操作，仍需记录文件操作阶段并按实际两端状态恢复。
 
@@ -94,7 +96,7 @@
 
 ## 应用生命周期与部署
 
-已确定采用原生菜单栏与同步引擎同进程，关闭配置窗口继续运行，退出应用停止同步。M5 与 M6 实现应用生命周期及登录启动，M1 暂保留现有后台脚本。登录启动不能代替 KeepAlive。
+已确定采用原生菜单栏与同步引擎同进程，关闭配置窗口继续运行，退出应用停止同步。M5 与 M6 实现应用生命周期及登录启动，M1、M2 暂保留现有后台脚本。登录启动不能代替 KeepAlive。
 
 macOS 13 及以上可以使用 SMAppService 管理登录项或内置 LaunchAgent。迁移时清理或停用旧服务，保证同一账号只有一个有效处理者。应用和服务使用本项目确定的标识，避免与原版安装冲突。
 
@@ -102,7 +104,7 @@ macOS 13 及以上可以使用 SMAppService 管理登录项或内置 LaunchAgent
 
 参考：[SMAppService](https://developer.apple.com/documentation/servicemanagement/smappservice)、[mainApp](https://developer.apple.com/documentation/servicemanagement/smappservice/mainapp)、[命令行工具](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools)、[应用公证](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)。
 
-## M1 实现位置
+## M1 核心与兼容实现
 
 | 实现 | 文件 |
 | --- | --- |
@@ -115,10 +117,32 @@ macOS 13 及以上可以使用 SMAppService 管理登录项或内置 LaunchAgent
 | 授权配置、后台运行、模拟自测与入口 | `Sources/App/` |
 | 独立核心回归测试 | `Tests/SyncCoreTests/` |
 
-M1 数据库包含 `configuration`、`baseline`、`transfers`、`bookmarks` 四张单账号表，使用 `PRAGMA user_version = 1`。身份和观察快照以结构化编码保存在 BLOB 字段；来源关系仍是一源一目标的过渡实现，多实体共享及多账号在后续版本迁移中实现。
+M1 数据库包含 `configuration`、`baseline`、`transfers`、`bookmarks` 四张单账号表，使用 `PRAGMA user_version = 1`。身份和观察快照以结构化编码保存在 BLOB 字段；来源关系仍是一源一目标的过渡实现，M2 已加入多账号，多实体共享留待 M3。v1 类只用于旧格式校验、迁移及旧回归夹具；应用不再用它保存当前配置。
 
 每次状态提交仅更新发生变化的基线与同步记录，不重写整个 JSON。安全移动前先持久化 planned 阶段，链接完成后提交 linked；普通批量关联清理合并提交。状态保存失败会停止当前扫描，待下一轮先补齐持久化后再操作文件。
 
 文件移动后若目标身份不符，保留冲突而不把未知目标回退到微信源目录。planned 阶段恢复时，若原目标已改名，则在管理根目录按原身份寻找，先持久化新的计划路径，再在下一轮完成链接。
 
 目标身份改变时先在管理根目录寻找原身份，找不到则进入冲突状态，保留文件而不自动接管替换内容。已存在的冲突记录需在后续恢复功能中处理。M1 仍沿用失联后移除旧链接与活动记录的行为，M4 再加入长期关联历史与手动恢复。
+
+## M2 实现位置与提交边界
+
+| 实现 | 文件 |
+| --- | --- |
+| 账号 UUID、目录身份与配置操作模型 | `Sources/Core/Accounts.swift` |
+| SQLite 连接、参数绑定、事务及一致备份 | `Sources/Core/SQLiteConnection.swift` |
+| v2 表、迁移、配置仓库与账号限定存储 | `Sources/Core/AccountRepository.swift` |
+| 账号校验、目录注册恢复、暂停、备注和重新授权 | `Sources/Core/AccountManager.swift` |
+| 串行调度、逐账号授权租约和错误隔离 | `Sources/Core/SyncCoordinator.swift` |
+| 同轮共享的惰性身份索引 | `Sources/Core/ManagedRootIndex.swift` |
+| 严格解析账号命令，未知参数报错 | `Sources/Core/Command.swift` |
+
+v2 使用 `managed_roots`、`accounts`、`baseline`、`transfers`、`account_operations` 五张表。基线与记录的主键为 `(account_id, relative)`，外键不级联清除；源身份的唯一键由设备、inode、创建时间字段构成，不依赖 BLOB 的 JSON 字节顺序。账号内的 worker 快照仍沿用 `SyncState.version = 1` 结构，这不是数据库版本。
+
+一个 `AccountRepository` 连接由所有 `AccountStateStore` 共享，适配器保存只更新本账号记录，不改授权、备注或暂停意图。配置入口和后台都先取得进程写入锁；列表、检查以只读连接读取且不迁移。M2 不支持后台运行中修改配置。
+
+`AccountManager` 先保存含基线的操作计划，再准备独占临时目录并记录身份，排他改名后在事务中注册账号并清除计划。失败保留计划及目录；没有可靠身份的目录不自动接管或删除。迁移账号已有记录，目录准备完成时只更新归档绑定，不重放基线或覆盖同步记录。恢复以当前持久化计划为准，完成后的旧计划重放不再创建目录；账号移除只清除计划的授权并标记停用，保留操作已经确定的目标与身份。未完成新增账号也可移除并保留原基线，显式恢复后继续原操作。
+
+`SyncWorker` 先维护已有记录与 planned 操作，再根据账号开关及归档身份接纳新文件；所有初次选址和重名重试都保存根目录相对路径。`SyncCoordinator` 串行调度，各账号分别获取、释放源访问租约。根目录授权在后台运行期间持有，每轮复核根身份；源故障仅影响当前账号，持久化失败停止整轮并退出后台。
+
+共享 `ManagedRootIndex` 每轮按需枚举一次，缓存成功和失败结果，返回前再次核对实体身份；本程序移动实体后增量登记。下一轮重建，账号归属不随用户的整理位置变化。配置列表只显示用户意图和保存位置，授权的即时检查由 `--check` 完成，后台错误写入日志，完整状态界面留待 M5。

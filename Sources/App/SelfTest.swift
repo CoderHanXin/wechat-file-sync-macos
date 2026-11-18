@@ -8,19 +8,26 @@ func selfTest() throws {
     guard try isWeChatFileDirectory(validAccount), try !isWeChatFileDirectory(invalidAccount) else {
         throw SyncError.message("微信账号目录识别测试失败")
     }
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("wechat-sync-" + UUID().uuidString)
+    let root = try canonicalDirectory(FileManager.default.temporaryDirectory).appendingPathComponent("wechat-sync-" + UUID().uuidString)
     let source = root.appendingPathComponent("file", isDirectory: true)
     let month = source.appendingPathComponent("2026-11", isDirectory: true)
-    let managedRoot = root.appendingPathComponent("CustomArchive", isDirectory: true)
+    let sharedRoot = root.appendingPathComponent("CustomArchive", isDirectory: true)
     try FileManager.default.createDirectory(at: month, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: managedRoot, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: sharedRoot, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
     let old = month.appendingPathComponent("old.txt")
     try Data("old".utf8).write(to: old)
     let stateURL = root.appendingPathComponent("state.sqlite")
-    let store = try SQLiteStateStore(url: stateURL)
-    try store.save(initialState(source: source, managedRoot: managedRoot))
-    let worker = try SyncWorker(store: store, settleSeconds: 0)
+    let repository = try AccountRepository(url: stateURL)
+    let manager = AccountManager(repository: repository)
+    try manager.configureRoot(sharedRoot, bookmark: nil)
+    let account = try manager.add(source: source, name: "测试账号", bookmark: nil)
+    let managedRoot = sharedRoot.appendingPathComponent(account.archiveRelative)
+    func newWorker() throws -> SyncWorker {
+        try SyncWorker(store: AccountStateStore(repository: repository, accountID: account.id),
+                       archiveRelative: account.archiveRelative, archiveIdentity: account.archiveIdentity, settleSeconds: 0)
+    }
+    let worker = try newWorker()
     let incoming = month.appendingPathComponent("new.txt")
     try Data("new".utf8).write(to: incoming)
     try worker.scan()
@@ -31,7 +38,7 @@ func selfTest() throws {
           fileInfo(old.path)?.regular == true else {
         throw SyncError.message("新文件或历史文件测试失败")
     }
-    let restartedWorker = try SyncWorker(store: SQLiteStateStore(url: stateURL), settleSeconds: 0)
+    let restartedWorker = try newWorker()
     try FileManager.default.removeItem(at: target)
     try restartedWorker.scan()
     guard fileInfo(incoming.path) == nil, fileInfo(old.path)?.regular == true else {
@@ -79,12 +86,12 @@ func selfTest() throws {
         throw SyncError.message("恢复测试文件不存在")
     }
     restartedWorker.state.transfers["2026-11/recovery.txt"] = Transfer(
-        destination: recoveryTarget.lastPathComponent, temporary: recoveryTemporary.lastPathComponent,
+        destination: try relativePath(recoveryTarget, in: sharedRoot), temporary: recoveryTemporary.lastPathComponent,
         identity: recoveryInfo.identity, phase: .planned)
     try restartedWorker.save()
     try systemCall(symlink(recoveryTarget.path, recoveryTemporary.path), "创建恢复测试链接")
     try systemCall(renamex_np(recovery.path, recoveryTarget.path, UInt32(RENAME_EXCL)), "移动恢复测试文件")
-    let recoveredWorker = try SyncWorker(store: SQLiteStateStore(url: stateURL), settleSeconds: 0)
+    let recoveredWorker = try newWorker()
     try recoveredWorker.scan()
     guard linkTarget(recovery.path) == recoveryTarget.path,
           try String(contentsOf: recovery, encoding: .utf8) == "recovery" else {
@@ -95,5 +102,15 @@ func selfTest() throws {
     guard fileInfo(recovery.path) == nil else {
         throw SyncError.message("恢复后的删除同步测试失败")
     }
-    print("模拟测试通过")
+    let secondSource = root.appendingPathComponent("second-account/msg/file")
+    try FileManager.default.createDirectory(at: secondSource, withIntermediateDirectories: true)
+    let second = try manager.add(source: secondSource, name: "第二账号", bookmark: nil)
+    let secondFile = secondSource.appendingPathComponent("same.txt")
+    try Data("second".utf8).write(to: secondFile)
+    let coordinator = SyncCoordinator(repository: repository, settleSeconds: 0) { DirectoryLease(url: $0.sourceURL) }
+    _ = try coordinator.scan()
+    _ = try coordinator.scan()
+    guard linkTarget(secondFile.path) == sharedRoot.appendingPathComponent(second.archiveRelative + "/same.txt").path,
+          try repository.accounts().count == 2 else { throw SyncError.message("多账号隔离测试失败") }
+    print("M2 临时样本自测通过")
 }

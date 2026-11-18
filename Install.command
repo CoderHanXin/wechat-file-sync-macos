@@ -49,7 +49,7 @@ created_app=1
 ditto "$source_app" "$target_app"
 
 executable="$target_app/Contents/MacOS/WeChatDownloadSync"
-echo "请依次选择微信账号的 msg/file 文件夹和管理根目录（默认下载，可自定义）。"
+echo "首次配置请选择微信账号的 msg/file 文件夹、账号备注和管理根目录；已有配置将保留。"
 "$executable" --configure
 "$executable" --check
 

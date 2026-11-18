@@ -1,55 +1,63 @@
 import Foundation
-import Darwin
 
-func runBackground(appSupport: URL) throws {
-    let diagnostic = CommandLine.arguments.contains("--check") || CommandLine.arguments.contains("--diagnose")
-    let lock = try diagnostic ? nil : ProcessLock(url: appSupport.appendingPathComponent("sync.lock"))
-    defer { withExtendedLifetime(lock) {} }
-    let store = try diagnostic
-        ? SQLiteStateStore(url: appSupport.appendingPathComponent("state.sqlite"), readOnly: true)
-        : openConfiguredStore(appSupport: appSupport)
-    let state = try store.load()
-    guard let bookmarks = try store.bookmarks() else { throw SyncError.message("缺少目录授权，请重新配置") }
-    let data = bookmarks.source
-    var stale = false
-    let selection = try URL(resolvingBookmarkData: data, options: [.withSecurityScope],
-                            relativeTo: nil, bookmarkDataIsStale: &stale)
-    guard !stale, selection.startAccessingSecurityScopedResource() else {
-        throw SyncError.message("微信文件夹授权已失效")
+func listAccounts(_ repository: AccountRepository) throws {
+    guard let root = try repository.root() else { print("尚未配置管理根目录"); return }
+    print("管理根目录：\(root.path)")
+    print("以下为保存的配置状态；目录与授权请用 --check 检查，不代表后台实时运行状态。")
+    for account in try repository.accounts() {
+        let status = account.removed ? "已移除" : (account.intakeEnabled ? "同步新文件" : "暂停新文件（维护已有链接）")
+        print("\(account.id)  \(account.name)  [\(status)]\n  微信：\(account.source)\n  归档：\(root.path)/\(account.archiveRelative)")
     }
-    defer { selection.stopAccessingSecurityScopedResource() }
-    let rootData = bookmarks.managedRoot
-    var rootStale = false
-    let rootSelection = try URL(resolvingBookmarkData: rootData, options: [.withSecurityScope],
-                                    relativeTo: nil, bookmarkDataIsStale: &rootStale)
-    guard !rootStale, rootSelection.startAccessingSecurityScopedResource() else {
-        throw SyncError.message("管理根目录授权已失效")
+    for setup in try repository.pendingSetups() {
+        let action = setup.account.removed ? "已移除，须先用 --restore-account 重新授权恢复" : "可使用 --recover-accounts"
+        print("未完成配置：\(setup.account.id)  \(setup.account.name)；\(action)")
     }
-    defer { rootSelection.stopAccessingSecurityScopedResource() }
-    let source = URL(fileURLWithPath: state.source, isDirectory: true)
-    let managedRoot = URL(fileURLWithPath: state.managedRoot, isDirectory: true)
-    guard state.version == 1, try isWeChatFileDirectory(source),
-          selection.resolvingSymlinksInPath().path == source.resolvingSymlinksInPath().path,
-          rootSelection.resolvingSymlinksInPath().path == managedRoot.resolvingSymlinksInPath().path else {
-        throw SyncError.message("同步配置与授权路径不一致")
-    }
-    try validateConfiguration(state, source: selection, managedRoot: rootSelection)
-    if CommandLine.arguments.contains("--check") {
-        guard fileInfo(source.path)?.identity == state.sourceIdentity,
-              fileInfo(managedRoot.path)?.identity == state.managedRootIdentity else {
-            throw SyncError.message("同步目录已更改或不可用")
+}
+
+func checkAccounts(_ repository: AccountRepository, diagnose: Bool) throws {
+    let root = try rootLease(repository)
+    defer { withExtendedLifetime(root) {} }
+    guard let configuredRoot = try repository.root() else { throw SyncError.message("尚未配置管理根目录") }
+    var failures = 0
+    for account in try repository.accounts() where !account.removed {
+        do {
+            let source = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
+            defer { withExtendedLifetime(source) {} }
+            guard try isWeChatFileDirectory(source.url) else { throw SyncError.message("微信账号目录格式不正确") }
+            _ = try allFiles(source.url)
+            let archive = try checkedFile(configuredRoot.url, relative: account.archiveRelative)
+            guard let expected = account.archiveIdentity, try readFileInfo(archive.path)?.identity == expected else {
+                throw SyncError.message("账号归档目录不可用；如为迁移后首次配置，请停止后台并执行 --recover-accounts")
+            }
+            if diagnose { try diagnoseAccess(source: source.url, managedRoot: root.url) }
+            print("\(account.id) \(account.name)：授权和目录正常")
+        } catch {
+            failures += 1
+            print("\(account.id) \(account.name)：\(error)")
         }
-        _ = try allFiles(source)
-        print("文件夹授权和同步配置正常")
-        return
     }
-    if CommandLine.arguments.contains("--diagnose") {
-        try diagnoseAccess(source: source, managedRoot: managedRoot)
-        return
+    guard failures == 0 else { throw SyncError.message("\(failures) 个账号需要检查，其他账号可继续同步") }
+}
+
+func runBackground(repository: AccountRepository) throws {
+    let root = try rootLease(repository)
+    defer { withExtendedLifetime(root) {} }
+    try recoverAccounts(repository)
+    let coordinator = SyncCoordinator(repository: repository) { account in
+        let lease = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
+        guard try isWeChatFileDirectory(lease.url) else { throw SyncError.message("微信账号目录格式不正确") }
+        return lease
     }
-    let worker = try SyncWorker(store: store)
     while true {
-        do { try worker.scan() } catch { NSLog("同步检查失败：%@", String(describing: error)) }
+        do {
+            let result = try coordinator.scan()
+            for account in result.accounts {
+                if let error = account.error { NSLog("账号 %@ 暂停：%@", account.accountID, error) }
+            }
+        } catch let error as SyncError {
+            if case .persistence = error { throw error }
+            NSLog("同步检查失败：%@", error.description)
+        } catch { throw error }
         Thread.sleep(forTimeInterval: 2)
     }
 }

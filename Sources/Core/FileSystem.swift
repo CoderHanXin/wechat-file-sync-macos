@@ -60,8 +60,18 @@ func checkedFile(_ source: URL, relative: String) throws -> URL {
         throw SyncError.message("文件相对路径无效")
     }
     let file = source.appendingPathComponent(relative)
-    let root = source.resolvingSymlinksInPath().path
-    let parent = file.deletingLastPathComponent().resolvingSymlinksInPath().path
+    let root = try canonicalDirectory(source).path
+    // Foundation may stop resolving /var -> /private/var when a trailing directory
+    // does not exist yet. Resolve the closest existing ancestor before appending it.
+    var ancestor = file.deletingLastPathComponent()
+    var missing: [String] = []
+    while try readFileInfo(ancestor.path) == nil && ancestor.path != "/" {
+        missing.insert(ancestor.lastPathComponent, at: 0)
+        ancestor.deleteLastPathComponent()
+    }
+    var resolved = try canonicalDirectory(ancestor)
+    for component in missing { resolved.appendPathComponent(component) }
+    let parent = resolved.path
     guard parent == root || parent.hasPrefix(root + "/") else {
         throw SyncError.message("文件路径超出授权范围")
     }

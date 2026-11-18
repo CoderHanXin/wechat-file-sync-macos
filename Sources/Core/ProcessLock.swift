@@ -9,7 +9,7 @@ final class ProcessLock {
         guard descriptor >= 0 else { throw SyncError.system("打开同步锁", errno) }
         guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             close(descriptor)
-            throw SyncError.message("同步程序或配置流程已在运行")
+            throw SyncError.message("同步程序或配置流程已在运行；修改配置前请先停止后台（LaunchAgent 使用 launchctl bootout），完成后重新启动")
         }
     }
 

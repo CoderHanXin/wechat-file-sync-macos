@@ -52,36 +52,132 @@ func chooseDirectory(_ suggested: URL, title: String, message: String, requireMa
     return selection
 }
 
-func configure(appSupport: URL) throws {
-    let lock = try ProcessLock(url: appSupport.appendingPathComponent("sync.lock"))
-    defer { withExtendedLifetime(lock) {} }
+func activateConfigurationUI() {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     app.activate(ignoringOtherApps: true)
-    let suggestedRoot = try defaultManagedRoot()
-    let sourceSelection = try chooseDirectory(expectedWeChatRoot(), title: "选择微信文件夹",
-        message: "请选择微信账号目录下的 msg/file 文件夹。已有文件将留在原处。", requireMatch: false)
-    guard try isWeChatFileDirectory(sourceSelection) else {
-        throw SyncError.message("请选择微信账号目录下的 msg/file 文件夹")
+}
+
+func securityScope(bookmark: Data?, expected: URL, identity: Identity) throws -> DirectoryLease {
+    guard let bookmark else { throw SyncError.message("缺少目录授权，请重新授权原目录") }
+    var stale = false
+    let selected = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope],
+                           relativeTo: nil, bookmarkDataIsStale: &stale)
+    guard !stale, selected.startAccessingSecurityScopedResource() else { throw SyncError.message("目录授权已失效，请重新授权原目录") }
+    let lease = DirectoryLease(url: selected) { selected.stopAccessingSecurityScopedResource() }
+    guard try canonicalDirectory(selected).path == canonicalDirectory(expected).path,
+          try readFileInfo(selected.path)?.identity == identity else { throw SyncError.message("授权目录与原配置不一致") }
+    return lease
+}
+
+func selectSource(suggested: URL? = nil, matching: Bool = false) throws -> DirectoryLease {
+    activateConfigurationUI()
+    let selected = try chooseDirectory(suggested ?? expectedWeChatRoot(), title: "选择微信账号文件夹",
+        message: "请选择该微信账号目录下的 msg/file 文件夹。首次添加时已有文件将留在原处。", requireMatch: matching)
+    guard try isWeChatFileDirectory(selected), selected.startAccessingSecurityScopedResource() else {
+        throw SyncError.message("请选择并授权微信账号目录下的 msg/file 文件夹")
     }
-    let source = sourceSelection.standardizedFileURL
-    guard sourceSelection.startAccessingSecurityScopedResource() else {
-        throw SyncError.message("无法获得微信文件夹访问权限")
+    return DirectoryLease(url: selected) { selected.stopAccessingSecurityScopedResource() }
+}
+
+func newBookmark(_ url: URL) throws -> Data {
+    try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+}
+
+func askAccountName() throws -> String {
+    activateConfigurationUI()
+    let alert = NSAlert()
+    alert.messageText = "设置账号备注"
+    alert.informativeText = "新文件将归档到“微信文件/备注”下。以后修改备注不改变该文件夹名称。"
+    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+    field.stringValue = "微信账号"
+    alert.accessoryView = field
+    alert.addButton(withTitle: "添加")
+    alert.addButton(withTitle: "取消")
+    guard alert.runModal() == .alertFirstButtonReturn else { throw SyncError.message("已取消添加账号") }
+    return field.stringValue
+}
+
+func rootLease(_ repository: AccountRepository) throws -> DirectoryLease {
+    guard let root = try repository.root() else { throw SyncError.message("请先运行 --configure 配置管理根目录") }
+    return try securityScope(bookmark: root.bookmark, expected: root.url, identity: root.identity)
+}
+
+@discardableResult
+func recoverAccounts(_ repository: AccountRepository) throws -> Int {
+    let manager = AccountManager(repository: repository)
+    var failures = 0
+    for setup in try repository.pendingSetups() {
+        if let account = try repository.accounts().first(where: { $0.id == setup.account.id }), account.removed { continue }
+        do {
+            let source = try securityScope(bookmark: setup.account.sourceBookmark,
+                                           expected: setup.account.sourceURL, identity: setup.account.sourceIdentity)
+            defer { withExtendedLifetime(source) {} }
+            try manager.recover(setup)
+        } catch let error as SQLiteStoreError { throw SyncError.persistence(error.description) }
+        catch {
+            failures += 1
+            NSLog("账号配置尚未恢复 %@：%@", setup.account.id, String(describing: error))
+        }
     }
-    defer { sourceSelection.stopAccessingSecurityScopedResource() }
-    let rootSelection = try chooseDirectory(suggestedRoot, title: "选择管理根目录",
-        message: "请选择保存文件并跟踪改名、移动的管理根目录。下载目录仅为默认建议。", requireMatch: false)
-    guard rootSelection.startAccessingSecurityScopedResource() else {
-        throw SyncError.message("无法获得管理根目录访问权限")
+    return failures
+}
+
+/// Called only after the entry point acquired ProcessLock.
+func runConfiguration(_ command: Command, repository: AccountRepository) throws {
+    let manager = AccountManager(repository: repository)
+    let hasExistingAccounts = try !repository.accounts().filter { !$0.removed }.isEmpty
+    let hasPendingSetups = try !repository.pendingSetups().isEmpty
+    if command == .configure && (hasExistingAccounts || hasPendingSetups) {
+        let root = try rootLease(repository)
+        defer { withExtendedLifetime(root) {} }
+        guard try recoverAccounts(repository) == 0 else { throw SyncError.message("已有配置需重新授权或恢复，请使用 --list-accounts 查看账号 ID") }
+        print("已有账号配置已保留；新增账号请使用 --add-account，重新授权请使用 --reauthorize-account")
+        return
     }
-    defer { rootSelection.stopAccessingSecurityScopedResource() }
-    let sourceBookmark = try sourceSelection.bookmarkData(options: [.withSecurityScope],
-                                                           includingResourceValuesForKeys: nil, relativeTo: nil)
-    let rootBookmark = try rootSelection.bookmarkData(options: [.withSecurityScope],
-                                                                includingResourceValuesForKeys: nil, relativeTo: nil)
-    let store = try openConfiguredStore(appSupport: appSupport)
-    try configureDirectories(store: store, source: source, managedRoot: rootSelection.standardizedFileURL,
-                             bookmarks: DirectoryBookmarks(source: sourceBookmark, managedRoot: rootBookmark))
+    switch command {
+    case .pauseAccount(let id): try manager.setPaused(id, paused: true)
+    case .resumeAccount(let id): try manager.setPaused(id, paused: false)
+    case .renameAccount(let id, let name): try manager.rename(id, name: name)
+    case .removeAccount(let id): try repository.remove(id)
+    case .restoreAccount(let id), .reauthorizeAccount(let id):
+        let account = try repository.configurationAccount(id)
+        let source = try selectSource(suggested: account.sourceURL, matching: true)
+        defer { withExtendedLifetime(source) {} }
+        try manager.reauthorize(id, source: source.url, bookmark: newBookmark(source.url), restoring: command == .restoreAccount(id))
+    case .reauthorizeRoot:
+        guard let root = try repository.root() else { throw SyncError.message("尚未配置管理根目录") }
+        activateConfigurationUI()
+        let selected = try chooseDirectory(root.url, title: "重新授权管理根目录", message: "请选择原管理根目录。M2 不更换归档位置。", requireMatch: true)
+        guard selected.startAccessingSecurityScopedResource() else { throw SyncError.message("无法获得管理根目录权限") }
+        defer { selected.stopAccessingSecurityScopedResource() }
+        try manager.configureRoot(selected, bookmark: newBookmark(selected))
+    case .configure, .addAccount:
+        let source = try selectSource()
+        defer { withExtendedLifetime(source) {} }
+        let name: String
+        if case .addAccount(let provided) = command, let provided { name = provided } else { name = try askAccountName() }
+        _ = try manager.checkedName(name)
+        let root: DirectoryLease
+        if try repository.root() == nil {
+            activateConfigurationUI()
+            let selected = try chooseDirectory(defaultManagedRoot(), title: "选择管理根目录",
+                message: "选择保存文件并跟踪改名、移动的目录。下载目录仅为默认建议。", requireMatch: false)
+            guard selected.startAccessingSecurityScopedResource() else { throw SyncError.message("无法获得管理根目录权限") }
+            root = DirectoryLease(url: selected) { selected.stopAccessingSecurityScopedResource() }
+            // Validate the pair before persisting root authorization.
+            _ = try initialState(source: canonicalDirectory(source.url), managedRoot: canonicalDirectory(selected))
+            try manager.configureRoot(selected, bookmark: newBookmark(selected))
+        } else { root = try rootLease(repository) }
+        defer { withExtendedLifetime(root) {} }
+        let account = try manager.add(source: source.url, name: name, bookmark: newBookmark(source.url))
+        print("已添加账号：\(account.name) ID=\(account.id)；已有文件保留原处")
+    case .recoverAccounts:
+        let root = try rootLease(repository)
+        defer { withExtendedLifetime(root) {} }
+        guard try recoverAccounts(repository) == 0 else { throw SyncError.message("部分账号配置尚未恢复，请检查错误并重新授权原目录") }
+    default: throw SyncError.message("该命令不是配置操作")
+    }
 }
 
 func diagnoseAccess(source: URL, managedRoot: URL) throws {
