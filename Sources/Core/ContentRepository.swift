@@ -10,7 +10,8 @@ final class ContentRepository {
     private let decoder = JSONDecoder()
 
     init(url: URL, readOnly: Bool = false,
-         checkpoint: ((DatabaseMigrationCheckpoint) throws -> Void)? = nil) throws {
+         checkpoint: ((DatabaseMigrationCheckpoint) throws -> Void)? = nil,
+         recoveryCheckpoint: ((DatabaseMigrationCheckpoint) throws -> Void)? = nil) throws {
         let existed = FileManager.default.fileExists(atPath: url.path)
         accounts = try AccountRepository(url: url, readOnly: readOnly, allowContentSchema: true)
         if !readOnly, try accounts.root() == nil {
@@ -70,6 +71,25 @@ final class ContentRepository {
                 try validateForeignKeys()
                 try accounts.execute("PRAGMA user_version=3")
                 try checkpoint?(.beforeCommit)
+            }
+        }
+        if try accounts.scalar("PRAGMA user_version") == 3 {
+            guard !readOnly else { throw SyncError.message("请先停止后台并升级到 SQLite v4，只读查询不执行迁移") }
+            if existed {
+                try accounts.backup(to: url.deletingLastPathComponent().appendingPathComponent("state.v3-backup-\(UUID().uuidString).sqlite"))
+                try recoveryCheckpoint?(.backupCreated)
+            }
+            try accounts.transaction {
+                for account in try accounts.accounts() {
+                    for var source in try sources(account.id) where !source.active && source.endReason == nil {
+                        source.endReason = source.status == .missing ? .toolCleaned : .unknown
+                        try put(source)
+                    }
+                }
+                try recoveryCheckpoint?(.rowsCopied)
+                try validateForeignKeys()
+                try accounts.execute("PRAGMA user_version=4")
+                try recoveryCheckpoint?(.beforeCommit)
             }
         }
         for table in ["entities", "sources", "content_operations", "account_settings", "content_issues"] {

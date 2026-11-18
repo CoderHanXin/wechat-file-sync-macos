@@ -13,7 +13,7 @@ func runContentCommand(_ command: Command, store: ContentRepository) throws {
                 print("实体 \(entity.id) [\(entity.status.rawValue)] \(entity.relative)，记录权限=\(permission)（实时状态需检查）")
             }
             for source in try store.sources(account.id) where source.status != .linked {
-                print("来源 \(source.id) [\(source.status.rawValue)] \(source.relative)")
+                print("来源 \(source.id) [\(source.status.rawValue)/\(source.endReason?.rawValue ?? "unknown")] \(source.relative)")
             }
             for op in try store.operations(account.id) {
                 print("操作 \(op.id) \(op.kind.rawValue)/\(op.phase.rawValue)，临时名 \(op.temporary)，\(op.error ?? "待恢复")")
@@ -45,6 +45,28 @@ func runContentCommand(_ command: Command, store: ContentRepository) throws {
             }
         }
         if failures > 0 { throw SyncError.message("\(failures) 个实体权限需要检查") }
+    case .restoreLinks(let accountID, let entityID, let path):
+        let account = try store.accounts.account(accountID)
+        let root = try rootLease(store.accounts)
+        let source = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
+        defer { withExtendedLifetime((root, source)) {} }
+        let recovery = LinkRecovery(store: store)
+        let preview = try recovery.preview(accountID: accountID, entityID: entityID, file: URL(fileURLWithPath: path).standardizedFileURL)
+        print("账号：\(account.name)\n原位置：\(preview.original.relative)\n所选文件：\(preview.candidate.path)（\(preview.info.size) 字节）")
+        for choice in preview.choices {
+            print("\(choice.source.id) \(choice.source.originalName) · \(choice.source.relative)：\(choice.skipReason ?? choice.comparison)")
+        }
+        let available = Set(preview.choices.filter { $0.skipReason == nil }.map { $0.source.id })
+        guard !available.isEmpty else { print("没有可恢复的来源"); return }
+        print("选择来源 ID（逗号分隔，回车选择全部可恢复来源）：")
+        guard let selection = readLine() else { print("已取消"); return }
+        let ids = selection.isEmpty ? available : Set(selection.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+        guard ids.isSubset(of: available), !ids.isEmpty else { throw SyncError.message("来源选择无效") }
+        print("将把 \(ids.count) 条旧微信链接关联到所选文件。输入 RESTORE 确认；其他输入取消：")
+        guard readLine() == "RESTORE" else { print("已取消"); return }
+        let issues = try recovery.apply(preview, sourceIDs: ids)
+        for issue in issues { print("未完成 \(issue.relative)：\(issue.message)") }
+        print("恢复完成 \(ids.count - issues.count) 条，未完成 \(issues.count) 条；不保证微信历史消息仍可用。")
     case .recoverOperations(let selected):
         if let selected { _ = try store.accounts.account(selected) }
         let root = try rootLease(store.accounts)

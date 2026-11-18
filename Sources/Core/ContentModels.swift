@@ -2,9 +2,9 @@ import Foundation
 
 enum EntityStatus: String, Codable { case unchecked, pending, ready, modified, missing, conflict }
 enum SourceStatus: String, Codable { case pending, linked, detached, missing, conflict }
-enum ContentOperationKind: String, Codable { case create, attach, legacy, permission }
+enum ContentOperationKind: String, Codable { case create, attach, legacy, permission, clearLink, restoreLink }
 enum ContentOperationPhase: String, Codable { case planned, cleanup, rollback, conflict }
-enum ContentCheckpoint { case planSaved, swapped, associationSaved, duplicateRemoved, permissionChanged, rollbackSwapped, rollbackLinkRemoved, completed }
+enum ContentCheckpoint { case planSaved, swapped, associationSaved, duplicateRemoved, permissionChanged, rollbackSwapped, rollbackLinkRemoved, completed, linkCleared, recoveryPrepared, recoveryInstalled }
 
 struct ContentEntity: Codable, Equatable {
     let id: String
@@ -19,17 +19,20 @@ struct ContentEntity: Codable, Equatable {
     var verifiedToken: String? = nil
 }
 
+enum SourceEndReason: String, Codable { case toolCleaned, external, reused, unknown }
+
 struct ContentSource: Codable, Equatable {
     let id: String // Each reuse of a path creates a new source lifecycle.
     let accountID: String
     let relative: String
-    let entityID: String
+    var entityID: String
     let originalName: String
     let receivedIdentity: Identity
     let receivedDigest: String?
     var status: SourceStatus
     var active: Bool
     var linkRelative: String
+    var endReason: SourceEndReason? = nil
 }
 
 struct ContentOperation: Codable, Equatable {
@@ -46,5 +49,7 @@ struct ContentOperation: Codable, Equatable {
     var beforeMode: UInt16? = nil
     var afterMode: UInt16? = nil
     var error: String? = nil
+    var recoveryTargetID: String? = nil
+    var installedIdentity: Identity? = nil
     var linkTargets: [String]? = nil // Durable intended link destinations, including interrupted retargets.
 }

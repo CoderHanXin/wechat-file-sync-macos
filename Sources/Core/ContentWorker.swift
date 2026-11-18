@@ -9,18 +9,20 @@ final class ContentWorker {
     let clock: () -> Date
     let checkpoint: ((ContentCheckpoint) throws -> Void)?
     let transferCheckpoint: ((TransferCheckpoint) throws -> Void)?
+    private var nextRecoveryScan = Date.distantPast
+    let recoveryInterval: TimeInterval
     private var observations: [String: Observation] = [:]
     private var hashes: [String: ContentHashJob] = [:]
     let hashBudget: Int
     private(set) var report = ScanReport()
 
     init(store: ContentRepository, accountID: String, settleSeconds: TimeInterval = 15,
-         clock: @escaping () -> Date = Date.init, hashBudget: Int = 4 * 1024 * 1024,
+         clock: @escaping () -> Date = Date.init, hashBudget: Int = 4 * 1024 * 1024, recoveryInterval: TimeInterval = 30,
          checkpoint: ((ContentCheckpoint) throws -> Void)? = nil,
          transferCheckpoint: ((TransferCheckpoint) throws -> Void)? = nil) {
         self.store = store; self.accountID = accountID; self.settleSeconds = settleSeconds
         self.clock = clock; self.checkpoint = checkpoint; self.transferCheckpoint = transferCheckpoint
-        self.hashBudget = max(64 * 1024, hashBudget)
+        self.hashBudget = max(64 * 1024, hashBudget); self.recoveryInterval = recoveryInterval
     }
 
     private func process(_ relative: String, _ body: () throws -> Void) throws {
@@ -52,9 +54,23 @@ final class ContentWorker {
         defer { report.managedRootEnumerations = index.enumerations - before }
 
         try recover(account: account, root: root.url, index: index)
+        let pendingSources = Set(try store.operations(accountID).compactMap(\.sourceID))
+        for var source in try store.sources(accountID) where !source.active && source.endReason == .toolCleaned && !pendingSources.contains(source.id) {
+            try process(source.relative) {
+                let path = try checkedFile(account.sourceURL, relative: source.relative)
+                if let actual = try readFileInfo(path.path) {
+                    source.endReason = actual.regular ? .reused : .external
+                    try store.atomic { try store.put(source) }
+                }
+            }
+        }
+        let checkReturned = clock() >= nextRecoveryScan
+        if checkReturned { nextRecoveryScan = clock().addingTimeInterval(recoveryInterval) }
+        let recoverySources = try store.sources(accountID).filter { !$0.active && $0.endReason == .toolCleaned }
         let activeSources = try store.sources(accountID).filter { $0.active && $0.status != .conflict && $0.status != .pending }
         for entity in try store.entities(accountID) where entity.status != .pending
-            && (entity.status != .missing || activeSources.contains(where: { $0.entityID == entity.id })) {
+            && (entity.status != .missing || activeSources.contains(where: { $0.entityID == entity.id })
+                || (checkReturned && recoverySources.contains(where: { $0.entityID == entity.id }))) {
             try process(entity.relative) { try reconcile(entity, account: account, root: root.url, index: index) }
         }
         guard acceptNewFiles ?? account.intakeEnabled else { observations = [:]; hashes = [:]; return }
@@ -141,7 +157,7 @@ final class ContentWorker {
                 let oldTarget = try checkedFile(root, relative: source.linkRelative)
                 let actual = try readFileInfo(file.path)
                 if actual == nil || actual?.regular == true {
-                    source.active = false; source.status = .detached
+                    source.active = false; source.status = .detached; source.endReason = actual?.regular == true ? .reused : .external
                 } else if actual?.symbolicLink == true, let link = linkTarget(file.path) {
                     if available {
                         if link == oldTarget.path {
@@ -154,11 +170,17 @@ final class ContentWorker {
                             source.linkRelative = entity.relative; source.status = .linked
                         } else { source.status = .conflict }
                     } else if entity.status == .missing && link == oldTarget.path {
-                        try systemCall(unlink(file.path), "清理共享实体失联链接")
-                        source.status = .missing; source.active = false
+                        try LinkRecovery(store: store, checkpoint: checkpoint).clear(source)
+                        return
                     } else { source.status = .conflict }
                 } else { source.status = .conflict }
                 try store.atomic { try store.put(source) }
+            }
+        }
+        if available {
+            for source in try store.sources(accountID) where source.entityID == entity.id && !source.active && source.endReason == .toolCleaned {
+                guard !operating.contains(source.id) else { continue }
+                try process(source.relative) { try LinkRecovery(store: store, checkpoint: checkpoint).automatic(source, entity: entity) }
             }
         }
     }
@@ -273,6 +295,9 @@ final class ContentWorker {
 
     private func recover(account: Account, root: URL, index: ManagedRootIndex) throws {
         try recoverMoves(account: account, root: root, index: index)
+        for op in try store.operations(accountID) where op.kind == .clearLink || op.kind == .restoreLink {
+            try process(op.id) { try LinkRecovery(store: store, checkpoint: checkpoint).run(op) }
+        }
         for op in try store.operations(accountID) where op.kind == .attach || op.kind == .permission {
             try process(op.id) {
                 guard let original = try store.entities(accountID).first(where: { $0.id == op.entityID }) else { throw SyncError.persistence("操作实体缺失") }

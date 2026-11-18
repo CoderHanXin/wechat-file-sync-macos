@@ -17,7 +17,7 @@ struct ContentMigrationTests {
         } else { database = f.databaseURL }
         let store = try ContentRepository(url: database)
         let account = try #require(store.accounts.accounts().first)
-        #expect(try store.accounts.scalar("PRAGMA user_version") == 3)
+        #expect(try store.accounts.scalar("PRAGMA user_version") == 4)
         #expect(try store.accounts.loadState(account.id).baseline == before.baseline)
         #expect(try store.entities(account.id).first?.relative == "linked.txt")
         #expect(linkTarget(source.path) == f.target("linked.txt").path)
@@ -25,7 +25,7 @@ struct ContentMigrationTests {
         try store.accounts.execute("PRAGMA user_version=99")
         #expect(throws: (any Error).self) { try ContentRepository(url: database) }
         #expect(try store.accounts.scalar("PRAGMA user_version") == 99)
-        try store.accounts.execute("PRAGMA user_version=3")
+        try store.accounts.execute("PRAGMA user_version=4")
         #expect(try ContentRepository(url: database, readOnly: true).sources(account.id).count == 1)
     }
 
@@ -91,7 +91,7 @@ struct ContentMigrationTests {
         let before = try f.repository.loadState(b.id)
         let mode = try #require(fileInfo(f.target(a).path)?.mode)
         let v3 = try ContentRepository(url: f.repository.url)
-        #expect(try v3.accounts.scalar("PRAGMA user_version") == 3)
+        #expect(try v3.accounts.scalar("PRAGMA user_version") == 4)
         #expect(try v3.entities(a.id).count == 1)
         #expect(try v3.sources(a.id).first?.status == .linked)
         #expect(try v3.sources(a.id).first?.receivedDigest == nil)

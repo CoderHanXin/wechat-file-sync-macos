@@ -4,6 +4,7 @@ enum Command: Equatable {
     case background, help, selfTest, check, diagnose, listAccounts, configure
     case addAccount(String?), pauseAccount(String), resumeAccount(String), renameAccount(String, String)
     case removeAccount(String), restoreAccount(String), reauthorizeAccount(String), reauthorizeRoot, recoverAccounts
+    case restoreLinks(String, String, String)
     case setReadOnly(String, Bool), applyReadOnly(String, Bool), listFileIssues(String?), recoverOperations(String?)
 
     var readOnly: Bool {
@@ -49,12 +50,17 @@ enum Command: Equatable {
         if arguments.count == 4, arguments[0] == "--rename-account", arguments[2] == "--name", !arguments[1].isEmpty, !arguments[3].isEmpty {
             return .renameAccount(arguments[1], arguments[3])
         }
+        if arguments.count == 5, arguments[0] == "--restore-links", arguments[3] == "--file",
+           !arguments[1].isEmpty, !arguments[2].isEmpty, !arguments[4].isEmpty,
+           !arguments[1].hasPrefix("--"), !arguments[2].hasPrefix("--"), arguments[4].hasPrefix("/") {
+            return .restoreLinks(arguments[1], arguments[2], arguments[4])
+        }
         throw SyncError.message("命令或参数无效；使用 --help 查看用法")
     }
 }
 
 let commandHelp = """
-微信文件同步（M3）
+微信文件同步（M4）
   无参数                             后台同步所有已启用账号
   --configure                        首次配置管理根目录并添加账号
   --add-account [--name 备注]          添加微信账号（弹窗授权）
@@ -71,6 +77,8 @@ let commandHelp = """
   --apply-read-only ID on|off         显式调整已有实体的保护，未知原权限不解锁
   --list-file-issues [ID]             只读列出内容、来源及未完成操作状态
   --recover-operations [ID]           仅恢复记录中的操作，不接纳新文件
+  --restore-links ACCOUNT ENTITY --file /绝对路径
+                                    预览并确认用另一文件恢复旧链接
   --check                            只读检查授权及账号目录
   --diagnose                         在授权目录创建临时文件诊断（须停止后台）
   --self-test                        仅使用临时样本自检

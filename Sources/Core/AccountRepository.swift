@@ -37,7 +37,7 @@ final class AccountRepository: SQLiteConnection {
                 try execute("PRAGMA user_version = 2")
                 try migrationCheckpoint?(.beforeCommit)
             }
-        } else if version != 2 && !(allowContentSchema && version == 3) {
+        } else if version != 2 && !(allowContentSchema && (version == 3 || version == 4)) {
             throw SQLiteStoreError(description: "数据库版本 \(version) 需要迁移或不受支持，原数据库已保留；请停止后台后使用配置命令")
         }
         try rows("PRAGMA quick_check") {

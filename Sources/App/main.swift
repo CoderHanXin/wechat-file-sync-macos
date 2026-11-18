@@ -25,7 +25,7 @@ do {
         case .listAccounts: try listAccounts(content.accounts)
         case .check: try checkAccounts(content.accounts, diagnose: false)
         case .diagnose: try checkAccounts(content.accounts, diagnose: true)
-        case .setReadOnly, .applyReadOnly, .listFileIssues, .recoverOperations: try runContentCommand(command, store: content)
+        case .setReadOnly, .applyReadOnly, .listFileIssues, .recoverOperations, .restoreLinks: try runContentCommand(command, store: content)
         default: try runConfiguration(command, repository: content.accounts)
         }
     }

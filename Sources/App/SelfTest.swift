@@ -113,7 +113,7 @@ func selfTest() throws {
     guard linkTarget(secondFile.path) == sharedRoot.appendingPathComponent(second.archiveRelative + "/same.txt").path,
           try repository.accounts().count == 2 else { throw SyncError.message("多账号隔离测试失败") }
     try contentSelfTest()
-    print("M3 临时样本自测通过")
+    print("M4 临时样本自测通过")
 }
 
 private func contentSelfTest() throws {
@@ -130,7 +130,7 @@ private func contentSelfTest() throws {
     let first = source.appendingPathComponent("first.txt"), second = source.appendingPathComponent("forward.pdf")
     try Data("content".utf8).write(to: first)
     try Data("content".utf8).write(to: second)
-    let worker = ContentWorker(store: store, accountID: account.id, settleSeconds: 0)
+    let worker = ContentWorker(store: store, accountID: account.id, settleSeconds: 0, recoveryInterval: 0)
     try worker.scan(); try worker.scan()
     guard let target = linkTarget(first.path), target == linkTarget(second.path),
           try store.entities(account.id).count == 1, try store.sources(account.id).count == 2,
@@ -139,8 +139,21 @@ private func contentSelfTest() throws {
     try FileManager.default.moveItem(atPath: target, toPath: moved.path)
     try worker.scan()
     guard linkTarget(first.path) == moved.path, linkTarget(second.path) == moved.path else { throw SyncError.message("多来源改名自测失败") }
-    try FileManager.default.removeItem(at: moved)
+    let outside = temp.appendingPathComponent("暂时移出.txt")
+    try FileManager.default.moveItem(at: moved, to: outside)
     try worker.scan()
     guard try store.sources(account.id).count == 2, try store.entities(account.id).first?.status == .missing,
           fileInfo(first.path) == nil, fileInfo(second.path) == nil else { throw SyncError.message("多来源失联记录自测失败") }
+    try FileManager.default.moveItem(at: outside, to: moved)
+    try worker.scan()
+    guard linkTarget(first.path) == moved.path, linkTarget(second.path) == moved.path else { throw SyncError.message("原身份自动恢复自测失败") }
+    try FileManager.default.moveItem(at: moved, to: outside)
+    try worker.scan()
+    let copy = root.appendingPathComponent("用户选中的副本.txt")
+    try Data("content".utf8).write(to: copy)
+    guard let entity = try store.entities(account.id).first else { throw SyncError.message("恢复实体缺失") }
+    let recovery = LinkRecovery(store: store)
+    let preview = try recovery.preview(accountID: account.id, entityID: entity.id, file: copy)
+    guard fileInfo(first.path) == nil, try recovery.apply(preview).isEmpty,
+          linkTarget(first.path) == copy.path, linkTarget(second.path) == copy.path else { throw SyncError.message("副本恢复自测失败") }
 }
