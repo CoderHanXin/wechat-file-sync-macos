@@ -16,9 +16,10 @@ mkdir -p "$build/module-cache" "$dist"
 rm -rf "$release"
 mkdir -p "$app/Contents/MacOS"
 
+sources=("$root"/Sources/Core/*.swift "$root"/Sources/App/*.swift)
 for arch in arm64 x86_64; do
     xcrun swiftc -O -module-cache-path "$build/module-cache" \
-        -target "$arch-apple-macos13.0" "$root/main.swift" -o "$build/WeChatDownloadSync-$arch"
+        -target "$arch-apple-macos13.0" "${sources[@]}" -lsqlite3 -o "$build/WeChatDownloadSync-$arch"
 done
 xcrun lipo -create "$build/WeChatDownloadSync-arm64" "$build/WeChatDownloadSync-x86_64" \
     -output "$app/Contents/MacOS/WeChatDownloadSync"
@@ -28,6 +29,7 @@ codesign --force --sign - --entitlements "$root/entitlements.plist" "$app"
 codesign --verify --strict "$app"
 
 cp "$root/Install.command" "$root/Uninstall.command" "$root/README.md" "$root/LICENSE" "$release/"
+cp -R "$root/docs" "$release/docs"
 chmod +x "$release/Install.command" "$release/Uninstall.command"
 archive="$dist/WeChatDownloadSync-v$version-macOS.zip"
 rm -f "$archive"

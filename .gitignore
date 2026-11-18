@@ -1,5 +1,7 @@
 /build/
 /dist/
+/.build/
+/.swiftpm/
 /native-test
 /native-x86-test
 .DS_Store
