@@ -2,73 +2,76 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
-source_app="$here/WeChatDownloadSync.app"
-target_app="$HOME/Applications/WeChatDownloadSync.app"
-agent="$HOME/Library/LaunchAgents/io.github.whaoo0.wechat-download-sync.plist"
-label="io.github.whaoo0.wechat-download-sync"
-domain="gui/$(id -u)"
-log="$HOME/Library/Logs/WeChatDownloadSync.log"
-created_app=0
-created_agent=0
-temporary_plist=""
+source_app="$here/WeChatFileSync.app"
+applications="$HOME/Applications"
+target_app="$applications/WeChatFileSync.app"
+identifier="io.github.coderhanxin.wechat-file-sync"
+staging=""
+backup=""
+old_moved=0
+new_installed=0
 
-cleanup_on_error() {
+cleanup() {
     status=$?
     if [ "$status" -ne 0 ]; then
-        if [ "$created_agent" -eq 1 ]; then
-            launchctl bootout "$domain" "$agent" 2>/dev/null || true
-            rm -f "$agent"
+        if [ "$new_installed" -eq 1 ]; then rm -rf "$target_app"; fi
+        if [ "$old_moved" -eq 1 ]; then
+            if ! mv "$backup/WeChatFileSync.app" "$target_app"; then
+                echo "旧应用仍保留在：$backup/WeChatFileSync.app，请手动移回。" >&2
+                backup=""
+            fi
         fi
-        if [ "$created_app" -eq 1 ]; then
-            rm -rf "$target_app"
-        fi
-        if [ -n "$temporary_plist" ]; then
-            rm -f "$temporary_plist"
-        fi
-        echo "安装未完成。已有微信文件和已授权的配置数据均已保留。" >&2
+        echo "安装未完成。文件、微信链接、登录设置和配置数据未清除。" >&2
     fi
+    if [ -n "$staging" ]; then rm -rf "$staging"; fi
+    if [ -n "$backup" ]; then rm -rf "$backup"; fi
 }
-trap cleanup_on_error EXIT
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-if [ ! -d "$source_app" ]; then
-    echo "找不到 WeChatDownloadSync.app，请保留解压后的完整文件夹。" >&2
-    exit 1
-fi
-if [ -e "$target_app" ] || [ -e "$agent" ] || launchctl print "$domain/$label" >/dev/null 2>&1; then
-    echo "检测到已安装的版本，请先运行卸载脚本。" >&2
-    exit 1
-fi
-if launchctl print "$domain/local.wechat-download-sync" >/dev/null 2>&1; then
-    echo "检测到旧版同步服务，请先停用旧版，避免同时处理相同的文件。" >&2
-    exit 1
-fi
-codesign --verify --strict "$source_app"
-mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-mkdir "$target_app"
-created_app=1
-ditto "$source_app" "$target_app"
+verify_app() {
+    local candidate="$1"
+    local actual
+    if [ ! -d "$candidate" ] || [ -L "$candidate" ]; then
+        echo "应用目录不存在或是符号链接：$candidate" >&2; return 1
+    fi
+    actual=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist")
+    if [ "$actual" != "$identifier" ] || [ ! -x "$candidate/Contents/MacOS/WeChatFileSync" ]; then
+        echo "应用身份或可执行文件不符，不覆盖。" >&2; return 1
+    fi
+    codesign --verify --strict "$candidate"
+}
 
-executable="$target_app/Contents/MacOS/WeChatDownloadSync"
-echo "首次配置请选择微信账号的 msg/file 文件夹、账号备注和管理根目录；已有配置将保留。"
-"$executable" --configure
-"$executable" --check
-
-temporary_plist="$(mktemp "$HOME/Library/LaunchAgents/.wechat-sync.XXXXXX")"
-plutil -create xml1 "$temporary_plist"
-plutil -insert Label -string "$label" "$temporary_plist"
-plutil -insert ProgramArguments -array "$temporary_plist"
-plutil -insert ProgramArguments.0 -string "$executable" "$temporary_plist"
-plutil -insert RunAtLoad -bool YES "$temporary_plist"
-plutil -insert KeepAlive -bool YES "$temporary_plist"
-plutil -insert ThrottleInterval -integer 10 "$temporary_plist"
-plutil -insert ProcessType -string Background "$temporary_plist"
-plutil -insert StandardOutPath -string "$log" "$temporary_plist"
-plutil -insert StandardErrorPath -string "$log" "$temporary_plist"
-plutil -lint "$temporary_plist" >/dev/null
-ln "$temporary_plist" "$agent"
-created_agent=1
-rm -f "$temporary_plist"
-temporary_plist=""
-launchctl bootstrap "$domain" "$agent"
-trap - EXIT
-echo "安装完成，同步程序将在登录后自动启动。"
+verify_app "$source_app"
+for label in io.github.whaoo0.wechat-download-sync local.wechat-download-sync; do
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        echo "检测到旧版同步服务，请自行停用后再安装，避免同时处理相同微信文件。" >&2
+        exit 1
+    fi
+done
+if [ -L "$applications" ] || [ -L "$target_app" ]; then
+    echo "安装目标为符号链接，请先自行处理。" >&2; exit 1
+fi
+if [ -e "$target_app" ]; then
+    verify_app "$target_app"
+    "$target_app/Contents/MacOS/WeChatFileSync" --check-stopped
+fi
+mkdir -p "$applications"
+staging="$(mktemp -d "$applications/.wechat-file-sync-install.XXXXXX")"
+ditto "$source_app" "$staging/WeChatFileSync.app"
+verify_app "$staging/WeChatFileSync.app"
+if [ -e "$target_app" ]; then
+    "$target_app/Contents/MacOS/WeChatFileSync" --check-stopped
+    backup="$(mktemp -d "$applications/.wechat-file-sync-backup.XXXXXX")"
+    mv "$target_app" "$backup/WeChatFileSync.app"
+    old_moved=1
+fi
+mv "$staging/WeChatFileSync.app" "$target_app"
+new_installed=1
+verify_app "$target_app"
+# Installation does not configure directories or enable a login item.
+echo "已安装到：$target_app。首次打开后在设置中配置；登录启动默认关闭。"
+if ! open "$target_app"; then
+    echo "应用已安装，但未能打开。请在访达中手动打开它。" >&2
+fi

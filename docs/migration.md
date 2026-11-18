@@ -1,10 +1,10 @@
 # 状态迁移说明
 
-更新日期：2026-11-18。M2 基线为 SQLite v2，当前 `codex/content-dedup-readonly` 使用 SQLite v3，尚未发布。真实旧版安装升级及安全范围授权流程留待 M6 实机验收。
+更新日期：2026-11-19。当前候选使用 SQLite v4，尚未发布；下方保留 v1 至 v3 的历史迁移说明。真实旧版安装升级及安全范围授权流程留待 M6 实机验收。
 
 ## 数据位置与格式
 
-状态仍位于当前应用容器的应用支持目录 `WeChatDownloadSync/state.sqlite`。M1 的数据库版本为 1，M2 的 `PRAGMA user_version` 为 2，包含共享根目录、独立账号、按账号划分的历史基线和同步记录，以及未完成配置操作。
+当前 fork 使用独立标识 `io.github.coderhanxin.wechat-file-sync`，状态位于其沙盒容器 Application Support/WeChatFileSync/state.sqlite。原作者容器和历史 WeChatDownloadSync 路径不自动读取；用户已确认本机无原版安装，未执行实际配置迁移。M1 的数据库版本为 1，M2 的 `PRAGMA user_version` 为 2，包含共享根目录、独立账号、按账号划分的历史基线和同步记录，以及未完成配置操作。
 
 应用启动或写入型配置命令先取得同一个 `sync.lock`，再打开数据库并按需迁移。修改账号前应停止后台，具体操作见 [用户指南](user-guide.md)。只读列表与 `--check` 不迁移旧格式；旧版本需由持锁的正常启动或配置命令完成升级。
 

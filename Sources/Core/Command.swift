@@ -1,7 +1,7 @@
 import Foundation
 
 enum Command: Equatable {
-    case application, background, help, selfTest, check, diagnose, listAccounts, configure
+    case application, background, checkStopped, disableLogin, help, selfTest, check, diagnose, listAccounts, configure
     case addAccount(String?), pauseAccount(String), resumeAccount(String), renameAccount(String, String)
     case removeAccount(String), restoreAccount(String), reauthorizeAccount(String), reauthorizeRoot, recoverAccounts
     case restoreLinks(String, String, String)
@@ -15,6 +15,8 @@ enum Command: Equatable {
         switch arguments {
         case []: return .application
         case ["--background"]: return .background
+        case ["--check-stopped"]: return .checkStopped
+        case ["--disable-login-item"]: return .disableLogin
         case ["--help"], ["-h"]: return .help
         case ["--self-test"]: return .selfTest
         case ["--check"]: return .check
@@ -81,6 +83,8 @@ let commandHelp = """
   --recover-operations [ID]           仅恢复记录中的操作，不接纳新文件
   --restore-links ACCOUNT ENTITY --file /绝对路径
                                     预览并确认用另一文件恢复旧链接
+  --check-stopped                    安装辅助：确认应用与同步写入已停止
+  --disable-login-item               卸载辅助：停止后注销登录启动
   --check                            只读检查授权及账号目录
   --diagnose                         在授权目录创建临时文件诊断（须停止后台）
   --self-test                        仅使用临时样本自检

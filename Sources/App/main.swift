@@ -7,6 +7,8 @@ do {
     case .help: print(commandHelp)
     case .selfTest: try selfTest()
     case .application: runDesktop()
+    case .checkStopped: try checkApplicationStopped()
+    case .disableLogin: try disableApplicationLogin()
     default:
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("WeChatFileSync", isDirectory: true)

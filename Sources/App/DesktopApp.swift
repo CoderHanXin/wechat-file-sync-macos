@@ -68,7 +68,7 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     private let rootLabel = NSTextField(wrappingLabelWithString: "未选择归档目录")
     private let accountPicker = NSPopUpButton()
     private let accountInfo = NSTextField(wrappingLabelWithString: "添加后只整理新接收文件，已有微信文件留在原处。")
-    fileprivate let readOnly = NSButton(checkboxWithTitle: "以后新建的文件默认只读", target: nil, action: nil)
+    fileprivate let readOnly = NSButton(checkboxWithTitle: "新建的归档文件默认只读", target: nil, action: nil)
     private let login = NSButton(checkboxWithTitle: "登录时启动", target: nil, action: nil)
     private let loginStatus = NSTextField(labelWithString: "")
     private var actionButtons: [NSButton] = []
@@ -142,6 +142,7 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         accountInfo.isSelectable = true; accountInfo.textColor = .secondaryLabelColor
         accountPicker.target = self; accountPicker.action = #selector(selectAccount(_:))
         readOnly.target = self; readOnly.action = #selector(toggleReadOnly(_:))
+        readOnly.toolTip = "复用已有归档时保持它的权限；此开关不会批量修改旧文件。"
         login.target = self; login.action = #selector(toggleLogin(_:))
         loginStatus.font = .systemFont(ofSize: 11); loginStatus.textColor = .secondaryLabelColor
         let note = NSTextField(wrappingLabelWithString: "原文件回到管理范围会自动恢复本程序清理的链接。另一份副本请使用“恢复文件关联”。删除实际文件会影响所有共享入口；本工具不备份内容。")
@@ -182,7 +183,17 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         if let previous, let index = snapshot?.accounts.firstIndex(where: { $0.id == previous }) { accountPicker.selectItem(at: index) }
         selectedID = accountPicker.selectedItem?.representedObject as? String
         updateAccount()
-        for button in actionButtons { button.isEnabled = !busy && snapshot != nil && !terminating }
+        for button in actionButtons {
+            button.isEnabled = !busy && snapshot != nil && !terminating
+            let action = button.action
+            if [#selector(pauseAccount(_:)), #selector(renameAccount(_:)), #selector(authorizeAccount(_:)), #selector(removeAccount(_:)), #selector(restoreLinks(_:))].contains(where: { $0 == action }) {
+                button.isEnabled = button.isEnabled && account != nil
+                if account?.removed == true && action != #selector(authorizeAccount(_:)) && action != #selector(renameAccount(_:)) { button.isEnabled = false }
+            }
+            if action == #selector(openRoot(_:)) || action == #selector(addAccount(_:)) { button.isEnabled = button.isEnabled && snapshot?.root != nil }
+            if action == #selector(pauseAccount(_:)) { button.title = account?.intakeEnabled == false ? "继续同步" : "暂停新增" }
+            if action == #selector(authorizeRoot(_:)) { button.title = snapshot?.root == nil ? "选择归档目录…" : "重新授权目录…" }
+        }
         accountPicker.isEnabled = !busy && !terminating
         readOnly.isEnabled = !busy && account != nil && account?.removed == false && !terminating
         login.isEnabled = !busy && !terminating
@@ -378,8 +389,9 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
 }
 
 func runDesktop() {
+    let app = NSApplication.shared
     let controller = DesktopController()
-    let app = NSApplication.shared; app.delegate = controller
+    app.delegate = controller
     withExtendedLifetime(controller) { app.run() }
 }
 

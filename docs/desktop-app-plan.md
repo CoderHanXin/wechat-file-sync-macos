@@ -18,13 +18,13 @@
 - 已有实体批量权限和诊断命令继续作为低频 CLI；不为每条命令制作按钮。
 - 手动恢复在一个简单对话框中选失联实体及副本，显示逐来源差异与选择；执行仍调用 M4 的同一服务。
 - 登录启动默认不开启，用户在设置中显式开启。采用 macOS 13+ 的 `SMAppService.mainApp`，真实状态为待批准时提示系统设置。关闭应用不注销登录启动，也不在本次会话自动重启。
-- 独立容器中当前配置路径使用 Application Support 下 `WeChatFileSync/state.sqlite`，CLI 与菜单栏共享；构建文件和安装脚本在 M6 统一命名。
+- 独立容器中当前配置路径使用 Application Support 下 `WeChatFileSync/state.sqlite`，CLI 与菜单栏共享；M6 已将构建文件和安装脚本统一为 WeChatFileSync。
 
 ## 实施及验收
 
 M5 接入菜单栏、设置窗口、串行会话和恢复对话框；临时数据库覆盖写锁、配置后的账号意图和故障隔离。单独编译的 `DESKTOP_TESTING` 窗口夹具只生成假账号，不启动桌面 worker，不操作安全书签或登录项，检查控件状态、布局边界和关闭／重新打开。
 
-M6 收敛为一个安装路径、一个登录启动机制；安装与配置分开，升级先确认应用已退出，复制并验证后替换，保留状态。卸载先停止应用并取消登录启动，只移除应用，不删除归档、微信链接或状态。脚本测试使用临时 HOME、假应用及命令替身，不能运行真实安装脚本。
+M6 已收敛为一个安装路径、一个登录启动机制；安装与配置分开，升级先确认应用已退出，复制并验证后替换，保留状态。卸载先停止应用并取消登录启动，只移除应用，不删除归档、微信链接或状态。脚本测试使用临时 HOME、假应用及命令替身，不能运行真实安装脚本。
 
 参考：[SMAppService](https://developer.apple.com/documentation/servicemanagement/smappservice)、[退出延迟及完成回调](https://developer.apple.com/documentation/appkit/nsapplication/reply%28toapplicationshouldterminate%3A%29)。登录启动不提供崩溃 KeepAlive 的保证。
 

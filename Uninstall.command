@@ -1,15 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-agent="$HOME/Library/LaunchAgents/io.github.whaoo0.wechat-download-sync.plist"
-app="$HOME/Applications/WeChatDownloadSync.app"
-domain="gui/$(id -u)"
-
-if [ -f "$agent" ]; then
-    launchctl bootout "$domain" "$agent" 2>/dev/null || true
-    rm -f "$agent"
+app="$HOME/Applications/WeChatFileSync.app"
+identifier="io.github.coderhanxin.wechat-file-sync"
+if [ ! -e "$app" ]; then
+    echo "未找到已安装应用。归档、微信链接和配置数据均未修改。"
+    exit 0
 fi
-if [ -d "$app" ] && [ ! -L "$app" ]; then
-    rm -rf "$app"
+if [ -L "$app" ] || [ ! -d "$app" ]; then
+    echo "应用路径不是普通目录，请自行处理。" >&2; exit 1
 fi
-echo "后台程序已卸载。已下载的文件、微信中的链接和程序配置数据予以保留。"
+actual=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+if [ "$actual" != "$identifier" ]; then echo "应用标识不同，不执行卸载。" >&2; exit 1; fi
+codesign --verify --strict "$app"
+executable="$app/Contents/MacOS/WeChatFileSync"
+"$executable" --check-stopped
+"$executable" --disable-login-item
+rm -rf "$app"
+echo "已注销登录启动并卸载应用。归档文件、微信链接和配置数据保留。"

@@ -180,17 +180,45 @@ final class LinkRecovery {
         let file = try sourceFile(source, account: account)
         let intended = try checkedFile(root.url, relative: relative)
         if op.kind == .clearLink {
-            if let actual = try readFileInfo(file.path) {
+            let temp = try temporary(op, source: source, account: account)
+            if try readFileInfo(temp.path) == nil, op.phase == .planned {
+                guard let actual = try readFileInfo(file.path) else {
+                    source.active = false; source.status = .detached; source.endReason = .external
+                    try store.atomic { try store.put(source); try store.finish(op) }
+                    return
+                }
                 guard actual == expected, linkTarget(file.path) == intended.path else {
                     source.active = false; source.status = .detached; source.endReason = actual.regular ? .reused : .external
                     try store.atomic { try store.put(source); try store.finish(op) }
                     return
                 }
                 _ = try context(op.accountID); _ = try sourceFile(source, account: account)
-                try systemCall(unlink(file.path), "清理失联链接")
+                // Move first, verify what was actually moved, then remove only the owned link.
+                try systemCall(renamex_np(file.path, temp.path, UInt32(RENAME_EXCL)), "隔离待清理链接")
+                try checkpoint?(.linkQuarantined)
+            }
+            if let actual = try readFileInfo(temp.path) {
+                guard actual.identity == expected.identity, actual.symbolicLink, linkTarget(temp.path) == intended.path else {
+                    if try readFileInfo(file.path) == nil {
+                        try systemCall(renamex_np(temp.path, file.path, UInt32(RENAME_EXCL)), "归还非预期源对象")
+                        source.active = false; source.status = .detached; source.endReason = .reused
+                        try store.atomic { try store.put(source); try store.finish(op) }
+                        return
+                    }
+                    source.active = false; source.status = .detached; source.endReason = .reused
+                    try store.atomic { try store.put(source) }
+                    throw SyncError.message("清理临时对象已变化，保留两处内容等待检查")
+                }
+                op.phase = .cleanup
+                try store.atomic { try store.put(op) }
+                _ = try context(op.accountID); _ = try sourceFile(source, account: account)
+                guard try readFileInfo(temp.path)?.identity == expected.identity else { throw SyncError.message("清理对象身份变化") }
+                try systemCall(unlink(temp.path), "清理已核对的失联链接")
                 try checkpoint?(.linkCleared)
             }
-            source.active = false; source.status = .missing; source.endReason = .toolCleaned
+            let occupied = try readFileInfo(file.path)
+            source.active = false; source.status = occupied == nil ? .missing : .detached
+            source.endReason = occupied == nil ? .toolCleaned : occupied!.regular ? .reused : .external
             try store.atomic { try store.put(source); try store.finish(op) }
             return
         }

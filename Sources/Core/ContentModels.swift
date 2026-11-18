@@ -4,7 +4,7 @@ enum EntityStatus: String, Codable { case unchecked, pending, ready, modified, m
 enum SourceStatus: String, Codable { case pending, linked, detached, missing, conflict }
 enum ContentOperationKind: String, Codable { case create, attach, legacy, permission, clearLink, restoreLink }
 enum ContentOperationPhase: String, Codable { case planned, cleanup, rollback, conflict }
-enum ContentCheckpoint { case planSaved, swapped, associationSaved, duplicateRemoved, permissionChanged, rollbackSwapped, rollbackLinkRemoved, completed, linkCleared, recoveryPrepared, recoveryInstalled }
+enum ContentCheckpoint { case planSaved, swapped, associationSaved, duplicateRemoved, permissionChanged, rollbackSwapped, rollbackLinkRemoved, completed, linkQuarantined, linkCleared, recoveryPrepared, recoveryInstalled }
 
 struct ContentEntity: Codable, Equatable {
     let id: String

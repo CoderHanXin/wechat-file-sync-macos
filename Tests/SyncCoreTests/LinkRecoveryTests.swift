@@ -281,4 +281,21 @@ final class LinkRecoveryTests {
         #expect(try f.store.operations(f.a.id).isEmpty)
     }
 
+    @Test func clearQuarantineInterruptionNeverDeletesReplacementContent() throws {
+        let f = try ContentFixture()
+        let source = try f.sync("a.txt")
+        let entity = try #require(f.store.entities(f.a.id).first)
+        try FileManager.default.removeItem(at: f.files.root.appendingPathComponent(entity.relative))
+        try worker(f, checkpoint: { if $0 == .linkQuarantined { throw SyncError.message("stop") } }).scan()
+        let op = try #require(f.store.operations(f.a.id).first)
+        let temp = source.deletingLastPathComponent().appendingPathComponent(op.temporary)
+        #expect(fileInfo(temp.path)?.symbolicLink == true)
+        try FileManager.default.removeItem(at: temp)
+        try Data("replacement preserved".utf8).write(to: temp)
+        try LinkRecovery(store: f.store).run(op)
+        #expect(try String(contentsOf: source, encoding: .utf8) == "replacement preserved")
+        #expect(try f.store.sources(f.a.id).first?.endReason == .reused)
+        #expect(try f.store.operations(f.a.id).isEmpty)
+    }
+
 }

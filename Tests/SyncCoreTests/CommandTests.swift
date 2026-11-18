@@ -4,6 +4,10 @@ import Testing
 struct CommandTests {
     @Test func supportedCommandsAreExplicit() throws {
         #expect(try Command.parse([]) == .application)
+        #expect(try Command.parse(["--background"]) == .background)
+        #expect(try Command.parse(["--check-stopped"]) == .checkStopped)
+        #expect(try Command.parse(["--disable-login-item"]) == .disableLogin)
+        #expect(try Command.parse(["--restore-links", "account", "entity", "--file", "/tmp/copy"]) == .restoreLinks("account", "entity", "/tmp/copy"))
         #expect(try Command.parse(["--list-accounts"]).readOnly)
         #expect(try Command.parse(["--check"]).readOnly)
         #expect(try Command.parse(["--pause-account", "uuid"]) == .pauseAccount("uuid"))
@@ -18,7 +22,8 @@ struct CommandTests {
 
     @Test(arguments: [["--unknown"], ["--pause-account"], ["--add-account", "--name"],
                       ["--self-test", "--configure"], ["--remove-account", "--check"], ["--check", "extra"],
-                      ["--rename-account", "id", "新名"]])
+                      ["--rename-account", "id", "新名"], ["--restore-links", "a", "e", "--file", "relative"],
+                      ["--restore-links", "a", "e"], ["--check-stopped", "extra"], ["--disable-login-item", "extra"]])
     func invalidCommandsNeverFallThroughToBackground(_ arguments: [String]) throws {
         #expect(throws: (any Error).self) { try Command.parse(arguments) }
     }
