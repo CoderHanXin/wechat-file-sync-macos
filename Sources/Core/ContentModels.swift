@@ -52,4 +52,5 @@ struct ContentOperation: Codable, Equatable {
     var recoveryTargetID: String? = nil
     var installedIdentity: Identity? = nil
     var linkTargets: [String]? = nil // Durable intended link destinations, including interrupted retargets.
+    var swappedQuarantine: Data? = nil // Exact system marker on our prepared link; never a source's original quarantine.
 }

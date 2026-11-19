@@ -135,9 +135,31 @@ final class OpenedContent {
         return result
     }
 
-    func compatibleMetadata(with other: OpenedContent) throws -> Bool {
+    static func quarantineOnLink(_ url: URL) throws -> Data? {
+        let key = "com.apple.quarantine"
+        let size = getxattr(url.path, key, nil, 0, 0, XATTR_NOFOLLOW)
+        if size < 0 && errno == ENOATTR { return nil }
+        guard size >= 0, size <= 64 * 1024 else { throw SyncError.message("准备链接的隔离属性无法安全读取") }
+        var data = Data(count: size)
+        let read = data.withUnsafeMutableBytes { getxattr(url.path, key, $0.baseAddress, size, 0, XATTR_NOFOLLOW) }
+        guard read == size else { throw SyncError.message("准备链接的隔离属性在读取时变化") }
+        return data
+    }
+
+    func compatibleMetadata(with other: OpenedContent, swappedQuarantine: Data? = nil) throws -> Bool {
         try validatePermissionSupport(); try other.validatePermissionSupport()
-        return try info.mode & 0o111 == other.info.mode & 0o111 && attributes() == other.attributes()
+        guard info.mode & 0o111 == other.info.mode & 0o111 else { return false }
+        var incoming = try attributes()
+        var archived = try other.attributes()
+        // The sandbox may add quarantine to the archived entity during its first move.
+        // Keep the archived attribute unchanged. Only accept the exact marker that our own
+        // prepared link propagated during RENAME_SWAP, recorded before that swap.
+        let key = "com.apple.quarantine"
+        if let swappedQuarantine, incoming[key] == swappedQuarantine, archived[key] != nil {
+            incoming.removeValue(forKey: key)
+        }
+        if incoming[key] == nil { archived.removeValue(forKey: key) }
+        return incoming == archived
     }
 }
 

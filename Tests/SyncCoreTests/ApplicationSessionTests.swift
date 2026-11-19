@@ -49,4 +49,18 @@ final class ApplicationSessionTests {
         #expect(try session.snapshot().message.contains("fake permission expired"))
         #expect(try session.snapshot().accounts.contains { $0.id == b.id })
     }
+    @Test func pendingSourceIssueRemainsVisibleBetweenRetries() throws {
+        let f = try MultiAccountFixture()
+        let a = try f.add(0)
+        let incoming = try f.incoming(0, "pending.txt")
+        let session = try ApplicationSession(database: f.repository.url,
+            rootAuthorization: { DirectoryLease(url: $0.url) }, sourceAuthorization: { DirectoryLease(url: $0.sourceURL) })
+        try session.store.recordIssue(a.id, relative: "pending.txt", message: "附加属性不兼容，保留源文件")
+        try session.scan()
+        #expect(try session.snapshot().message.contains("附加属性不兼容"))
+        try FileManager.default.removeItem(at: incoming)
+        try session.scan()
+        #expect(try !session.snapshot().message.contains("附加属性不兼容"))
+    }
+
 }

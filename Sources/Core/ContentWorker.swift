@@ -120,6 +120,13 @@ final class ContentWorker {
         }
         observations = observations.filter { current[$0.key] != nil }
         hashes = hashes.filter { current[$0.key] != nil }
+        // A retained source is still unresolved while it waits for the next stability pass.
+        // Don't alternate between an error and "healthy" simply because observation restarted.
+        for issue in try store.issues(accountID) where current[issue.relative]?.regular == true {
+            if !report.issues.contains(where: { $0.relative == issue.relative && $0.message == issue.message }) {
+                report.issues.append(issue)
+            }
+        }
     }
 
     private func locate(_ original: ContentEntity, root: URL, index: ManagedRootIndex) throws -> ContentEntity {

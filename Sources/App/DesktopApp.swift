@@ -102,6 +102,7 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     private var selectedID: String?
     private var terminating = false
     private var receivedInitialState = false
+    private var hasShownSettings = false
     private var stateUnavailable = true
     private var stateError: String?
     #if DESKTOP_TESTING
@@ -326,7 +327,9 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         outer.translatesAutoresizingMaskIntoConstraints = false; window.contentView!.addSubview(outer)
         NSLayoutConstraint.activate([outer.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
             outer.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor), outer.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
-            outer.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor), side.widthAnchor.constraint(equalToConstant: 200),
+            outer.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
+            window.contentView!.widthAnchor.constraint(greaterThanOrEqualToConstant: 880),
+            window.contentView!.heightAnchor.constraint(greaterThanOrEqualToConstant: 680), side.widthAnchor.constraint(equalToConstant: 200),
             body.widthAnchor.constraint(equalTo: window.contentView!.widthAnchor, constant: -200),
             sideStack.leadingAnchor.constraint(equalTo: side.leadingAnchor, constant: 10), sideStack.trailingAnchor.constraint(equalTo: side.trailingAnchor, constant: -10),
             sideStack.topAnchor.constraint(equalTo: side.topAnchor, constant: 58),
@@ -362,12 +365,20 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         rootLabel.stringValue = snapshot?.root?.path ?? "请选择用于保存微信文件的文件夹"
         rootLabel.toolTip = snapshot?.root.map { "\($0.path)\n程序只在这个文件夹内查找改名或移动后的文件。" }
         let previous = selectedID
-        accountPicker.removeAllItems()
-        for account in snapshot?.accounts ?? [] {
-            accountPicker.addItem(withTitle: WeChatDirectories.displayName(source: account.sourceURL) + (account.removed ? "（已停止管理）" : ""))
-            accountPicker.lastItem?.representedObject = account.id
+        let accounts = snapshot?.accounts ?? []
+        let titles = accounts.map { WeChatDirectories.displayName(source: $0.sourceURL) + ($0.removed ? "（已停止管理）" : "") }
+        let menuChanged = accountPicker.itemArray.count != accounts.count || zip(accountPicker.itemArray, accounts).contains {
+            $0.0.representedObject as? String != $0.1.id
+        } || accountPicker.itemTitles != titles
+        // Periodic status updates must not replace a menu while the user is selecting an account.
+        if menuChanged {
+            accountPicker.removeAllItems()
+            for (account, title) in zip(accounts, titles) {
+                accountPicker.addItem(withTitle: title)
+                accountPicker.lastItem?.representedObject = account.id
+            }
+            if let previous, let index = accounts.firstIndex(where: { $0.id == previous }) { accountPicker.selectItem(at: index) }
         }
-        if let previous, let index = snapshot?.accounts.firstIndex(where: { $0.id == previous }) { accountPicker.selectItem(at: index) }
         selectedID = accountPicker.selectedItem?.representedObject as? String
         updateAccount()
         for button in actionButtons {
@@ -431,7 +442,14 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    @objc fileprivate func showSettings(_ sender: Any?) { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refreshLogin() }
+    @objc fileprivate func showSettings(_ sender: Any?) {
+        window.makeKeyAndOrderFront(nil)
+        if !hasShownSettings {
+            window.setContentSize(NSSize(width: 960, height: 720))
+            window.center(); hasShownSettings = true
+        }
+        NSApp.activate(ignoringOtherApps: true); refreshLogin()
+    }
     @objc private func quit(_ sender: Any?) { NSApp.terminate(nil) }
     @objc private func selectAccount(_ sender: Any?) { selectedID = accountPicker.selectedItem?.representedObject as? String; render(nil, error: nil) }
 
@@ -516,7 +534,11 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
             }
             return addedID
         }, then: { [weak self] id in
-            self?.selectedID = id; self?.render(nil, error: nil)
+            guard let self else { return }
+            if let index = self.accountPicker.itemArray.firstIndex(where: { $0.representedObject as? String == id }) {
+                self.accountPicker.selectItem(at: index)
+            }
+            self.selectedID = id; self.render(nil, error: nil)
         })
     }
 
@@ -669,7 +691,7 @@ func desktopPreviewTest(output: URL, manual: Bool = false, autoClose: Bool = fal
         print("手动预览已退出；临时样本正在清理，未启动真实同步。")
         return
     }
-    controller.window.makeKeyAndOrderFront(nil)
+    controller.showSettings(nil)
     NSApp.activate(ignoringOtherApps: true)
     RunLoop.current.run(until: Date().addingTimeInterval(0.3))
     controller.window.contentView!.layoutSubtreeIfNeeded()
@@ -678,6 +700,8 @@ func desktopPreviewTest(output: URL, manual: Bool = false, autoClose: Bool = fal
     guard controller.account?.id == account.id, controller.readOnly.state == .on,
           !controller.applicationShouldTerminateAfterLastWindowClosed(NSApp) else { throw SyncError.message("设置窗口状态或生命周期不符") }
     let content = controller.window.contentView!
+    guard abs(content.bounds.width - 960) < 1, abs(content.bounds.height - 720) < 1 else { throw SyncError.message("首次显示没有保持默认窗口尺寸") }
+    try controller.reviewAccountSelection()
     try controller.reviewSettingsLayout()
     try content.dataWithPDF(inside: content.bounds).write(to: output.deletingPathExtension().appendingPathExtension("pdf"))
     try controller.writeGeneralPreview(output.deletingPathExtension().appendingPathExtension("general.pdf"))
@@ -708,6 +732,23 @@ func desktopPreviewTest(output: URL, manual: Bool = false, autoClose: Bool = fal
     print("临时样本设置界面、自定义目录、账号状态和关闭／重开检查通过")
 }
 fileprivate extension DesktopController {
+    func reviewAccountSelection() throws {
+        let good = snapshot!, first = good.accounts[0]
+        let second = Account(id: "preview-second", rootID: first.rootID, name: "second_preview",
+            source: first.sourceURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("second_preview/msg/file").path,
+            sourceIdentity: first.sourceIdentity, sourceBookmark: nil, archiveRelative: "微信文件/second_preview", archiveIdentity: first.archiveIdentity,
+            intakeEnabled: false, removedAt: nil, createdAt: first.createdAt + 1)
+        let two = ApplicationSnapshot(root: good.root, canChooseRoot: false, accounts: [first, second], readOnly: [first.id: true, second.id: false], recoverable: [:], message: "刷新状态")
+        render(two, error: nil)
+        accountPicker.selectItem(at: 1) // Selection may arrive just before its target/action callback.
+        render(two, error: nil)
+        precondition(account?.id == second.id && syncSwitch.state == .off && readOnly.state == .off, "状态刷新不能把账号切换重置为旧账号")
+        selectAccount(nil)
+        render(two, error: nil)
+        precondition(account?.id == second.id)
+        render(good, error: nil)
+    }
+
     @available(macOS 14.4, *)
     func captureOwnWindow(_ output: URL) throws {
         window.display(); window.contentView!.layoutSubtreeIfNeeded()

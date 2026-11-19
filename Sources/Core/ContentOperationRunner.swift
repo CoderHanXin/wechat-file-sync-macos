@@ -110,6 +110,12 @@ final class ContentOperationRunner {
                 _ = try paths(op, source: source, root: root, sourceRoot: sourceRoot)
                 try systemCall(symlink(target.path, temp.path), "创建去重链接")
             }
+            op.swappedQuarantine = nil
+            if try incoming.attributes()["com.apple.quarantine"] == nil,
+               try archived.attributes()["com.apple.quarantine"] != nil {
+                op.swappedQuarantine = try OpenedContent.quarantineOnLink(temp)
+            }
+            try store.atomic { try store.put(op) }
             try incoming.validate(); try archived.validate()
             _ = try paths(op, source: source, root: root, sourceRoot: sourceRoot)
             try systemCall(renamex_np(file.path, temp.path, UInt32(RENAME_SWAP)), "交换去重来源")
@@ -127,7 +133,7 @@ final class ContentOperationRunner {
             duplicate = try OpenedContent(temp, identity: expected.identity, scope: sourceRoot)
             archived = try OpenedContent(target, identity: entity.identity, scope: root)
             guard try duplicate.digest() == op.digest, try archived.digest() == op.digest,
-                  try duplicate.sameBytes(as: archived), try duplicate.compatibleMetadata(with: archived) else {
+                  try duplicate.sameBytes(as: archived), try duplicate.compatibleMetadata(with: archived, swappedQuarantine: op.swappedQuarantine) else {
                 throw SyncError.message("去重清理前内容或附加属性发生变化")
             }
         } catch {

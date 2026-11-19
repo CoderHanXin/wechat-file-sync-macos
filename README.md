@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-M1–M5 核心和最小设置界面已实现，M6 已实现安装、升级回滚、卸载及显式登录启动。当前为 **0.6.1 本地发行候选，尚未发布**。临时样本自动验证通过；真实微信、真实沙盒授权及登录／升级流程仍待用户允许后验收，不能视为可日常依赖的正式版本。实际结果见 [验收记录](docs/validation-report.md)。
+M1–M5 核心和最小设置界面已实现，M6 已实现安装、升级回滚、卸载及显式登录启动。当前为 **0.6.2-test 沙盒兼容修复候选，尚未发布**。180 项核心回归及独立安装沙盒的假账号验收通过；真实微信、默认应用标识下的登录／升级流程仍待验收，不能视为可日常依赖的正式版本。实际结果见 [验收记录](docs/validation-report.md) 和 [安装沙盒验收](docs/installed-sandbox-validation.md)。
 
 本项目 fork 自 [Whaoo0/wechat-download-sync-macos](https://github.com/Whaoo0/wechat-download-sync-macos)，起点为 `e2061d4`，保留原作者声明和 MIT 许可证。fork 的独立应用标识为 `io.github.coderhanxin.wechat-file-sync`，不自动读取原版容器。
 
@@ -38,11 +38,11 @@ M1–M5 核心和最小设置界面已实现，M6 已实现安装、升级回滚
 
 ```sh
 bash test.sh
-bash build.sh 0.6.1
+bash build.sh 0.6.2-test
 bash test-install.sh
 ```
 
-构建输出为 `dist/WeChatFileSync-v0.6.1-macOS.zip` 及 SHA-256 文件，包含 ARM64 和 x86_64。目标为 macOS 13+；Rosetta 自测不能代替 Intel 或 macOS 13 实机验证。当前使用 ad-hoc 本地签名，未完成 Developer ID 签名、公证及下载首次启动验收。
+构建输出为 `dist/WeChatFileSync-v0.6.2-test-macOS.zip` 及 SHA-256 文件，包含 ARM64 和 x86_64。目标为 macOS 13+；Rosetta 自测不能代替 Intel 或 macOS 13 实机验证。当前使用 ad-hoc 本地签名，未完成 Developer ID 签名、公证及下载首次启动验收。
 
 `bash test-desktop.sh` 另编译只含临时假账号的窗口检查，需要图形会话。没有既有屏幕录制权限时不请求权限，只输出文字 PDF 和结构检查，不把它视为完整原生外观验收。
 
