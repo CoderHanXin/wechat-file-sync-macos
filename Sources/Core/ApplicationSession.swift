@@ -31,7 +31,7 @@ final class ApplicationSession {
     func scan() throws {
         guard !halted else { return }
         do {
-            guard let root = try store.accounts.root() else { message = "请选择归档目录并添加账号"; return }
+            guard let root = try store.accounts.root() else { message = "先添加微信账号，再选择文件保存位置"; return }
             if lease == nil { lease = try rootAuthorization(root) }
             guard let lease, try canonicalDirectory(lease.url).path == canonicalDirectory(root.url).path,
                   try readFileInfo(lease.url.path)?.identity == root.identity else { throw SyncError.message("管理根目录授权不匹配") }
@@ -56,7 +56,10 @@ final class ApplicationSession {
                 return messages
             }
             let active = report.accounts.filter { !$0.paused }.count
-            message = errors.isEmpty ? (report.accounts.isEmpty ? "请添加微信账号" : "正常 · \(active) 个账号接纳新文件，其余暂停新增") : "需要处理：\(errors.prefix(3).joined(separator: "；"))"
+            if !errors.isEmpty { message = "需要处理：\(errors.prefix(3).joined(separator: "；"))" }
+            else if report.accounts.isEmpty { message = "请添加微信账号" }
+            else if active == 0 { message = "新文件同步已暂停" }
+            else { message = "同步正常 · \(active) 个账号已开启新文件同步" }
         } catch let error as SyncError {
             if case .persistence = error { halted = true }
             coordinator = nil; lease = nil; message = error.description

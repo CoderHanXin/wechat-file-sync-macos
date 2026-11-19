@@ -21,9 +21,8 @@ func checkAccounts(_ repository: AccountRepository, diagnose: Bool) throws {
     var failures = 0
     for account in try repository.accounts() where !account.removed {
         do {
-            let source = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
+            let source = try sourceScope(account)
             defer { withExtendedLifetime(source) {} }
-            guard try isWeChatFileDirectory(source.url) else { throw SyncError.message("微信账号目录格式不正确") }
             _ = try allFiles(source.url)
             let archive = try checkedFile(configuredRoot.url, relative: account.archiveRelative)
             guard let expected = account.archiveIdentity, try readFileInfo(archive.path)?.identity == expected else {
@@ -45,8 +44,7 @@ func runBackground(content: ContentRepository) throws {
     defer { withExtendedLifetime(root) {} }
     try recoverAccounts(repository)
     let coordinator = ContentCoordinator(store: content) { account in
-        let lease = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
-        guard try isWeChatFileDirectory(lease.url) else { throw SyncError.message("微信账号目录格式不正确") }
+        let lease = try sourceScope(account)
         return lease
     }
     while true {

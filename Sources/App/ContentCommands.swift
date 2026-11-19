@@ -48,7 +48,7 @@ func runContentCommand(_ command: Command, store: ContentRepository) throws {
     case .restoreLinks(let accountID, let entityID, let path):
         let account = try store.accounts.account(accountID)
         let root = try rootLease(store.accounts)
-        let source = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
+        let source = try sourceScope(account)
         defer { withExtendedLifetime((root, source)) {} }
         let recovery = LinkRecovery(store: store)
         let preview = try recovery.preview(accountID: accountID, entityID: entityID, file: URL(fileURLWithPath: path).standardizedFileURL)
@@ -74,8 +74,7 @@ func runContentCommand(_ command: Command, store: ContentRepository) throws {
         try recoverAccounts(store.accounts, accountID: selected)
         let coordinator = ContentCoordinator(store: store, acceptNewFiles: false) { account in
             if let selected, selected != account.id { throw SyncError.message("未选中此账号") }
-            let lease = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
-            guard try isWeChatFileDirectory(lease.url) else { throw SyncError.message("账号目录格式错误") }
+            let lease = try sourceScope(account)
             return lease
         }
         let result = try coordinator.scan()
