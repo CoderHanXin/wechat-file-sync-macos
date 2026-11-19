@@ -164,6 +164,7 @@ final class AccountRecoveryTests {
 
     @Test func failedRootReauthorizationKeepsBookmarkAndNeverRebinds() throws {
         let f = try MultiAccountFixture()
+        _ = try f.add(0)
         let root = try f.repository.root()
         #expect(throws: (any Error).self) { try f.manager.configureRoot(f.sources[0], bookmark: Data("wrong".utf8)) }
         #expect(try f.repository.root() == root)

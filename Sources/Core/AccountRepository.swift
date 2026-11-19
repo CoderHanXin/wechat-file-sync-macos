@@ -88,13 +88,18 @@ final class AccountRepository: SQLiteConnection {
         return result
     }
 
+    func canChooseRoot() throws -> Bool {
+        try scalar("SELECT count(*) FROM accounts") == 0 && scalar("SELECT count(*) FROM account_operations") == 0
+    }
+
     func configureRoot(_ root: ManagedRoot) throws {
         guard !readOnly else { throw SyncError.message("只读连接不允许修改配置") }
         if let current = try self.root() {
-            guard current.id == root.id && current.path == root.path && current.identity == root.identity else {
-                throw SyncError.message("M2 不支持更换管理根目录；请重新授权原目录")
-            }
-            try execute("UPDATE managed_roots SET bookmark=? WHERE id=?", [root.bookmark.map(SQLValue.blob) ?? .null, .text(root.id)])
+            guard current.id == root.id else { throw SyncError.message("管理根目录标识不一致") }
+            let same = current.path == root.path && current.identity == root.identity
+            guard try same || canChooseRoot() else { throw SyncError.message("已有账号或未完成配置，只能重新授权原管理根目录") }
+            try execute("UPDATE managed_roots SET path=?,identity=?,bookmark=? WHERE id=?", [
+                .text(root.path), .blob(try encoder.encode(root.identity)), root.bookmark.map(SQLValue.blob) ?? .null, .text(root.id)])
         } else {
             try execute("INSERT INTO managed_roots VALUES(?,?,?,?)", [
                 .text(root.id), .text(root.path), .blob(try encoder.encode(root.identity)), root.bookmark.map(SQLValue.blob) ?? .null])

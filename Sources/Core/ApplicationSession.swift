@@ -2,6 +2,7 @@ import Foundation
 
 struct ApplicationSnapshot {
     let root: ManagedRoot?
+    let canChooseRoot: Bool
     let accounts: [Account]
     let readOnly: [String: Bool]
     let recoverable: [String: [ContentEntity]]
@@ -29,8 +30,8 @@ final class ApplicationSession {
 
     func scan() throws {
         guard !halted else { return }
-        guard let root = try store.accounts.root() else { message = "请选择归档目录并添加账号"; return }
         do {
+            guard let root = try store.accounts.root() else { message = "请选择归档目录并添加账号"; return }
             if lease == nil { lease = try rootAuthorization(root) }
             guard let lease, try canonicalDirectory(lease.url).path == canonicalDirectory(root.url).path,
                   try readFileInfo(lease.url.path)?.identity == root.identity else { throw SyncError.message("管理根目录授权不匹配") }
@@ -69,6 +70,10 @@ final class ApplicationSession {
         }
     }
 
+    func stopScanning(_ reason: String) {
+        halted = true; coordinator = nil; lease = nil; message = reason
+    }
+
     func change(_ action: (ContentRepository) throws -> Void) throws {
         // Release observation jobs before changing configuration; durable jobs remain in SQLite.
         coordinator = nil; lease = nil
@@ -88,6 +93,6 @@ final class ApplicationSession {
                 sources.contains { $0.entityID == entity.id && !$0.active && $0.endReason != .external && $0.endReason != .reused }
             }
         }
-        return ApplicationSnapshot(root: try store.accounts.root(), accounts: accounts, readOnly: defaults, recoverable: lost, message: message)
+        return ApplicationSnapshot(root: try store.accounts.root(), canChooseRoot: try store.accounts.canChooseRoot(), accounts: accounts, readOnly: defaults, recoverable: lost, message: message)
     }
 }

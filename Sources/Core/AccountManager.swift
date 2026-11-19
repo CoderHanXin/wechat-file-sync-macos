@@ -14,12 +14,16 @@ final class AccountManager {
     func configureRoot(_ url: URL, bookmark: Data?) throws {
         let directory = try canonicalDirectory(url)
         guard let info = try readFileInfo(directory.path), info.directory else { throw SyncError.message("管理根目录不存在") }
-        if var existing = try repository.root() {
-            guard try canonicalDirectory(existing.url).path == directory.path, existing.identity == info.identity else {
-                throw SyncError.message("M2 不支持更换管理根目录；请重新授权原目录")
+        if let existing = try repository.root() {
+            if try !repository.canChooseRoot() {
+                guard try canonicalDirectory(existing.url).path == directory.path, existing.identity == info.identity else {
+                    throw SyncError.message("已有账号或未完成配置，只能重新授权原管理根目录")
+                }
+                var updated = existing; updated.bookmark = bookmark
+                try repository.configureRoot(updated)
+            } else {
+                try repository.configureRoot(ManagedRoot(id: existing.id, path: directory.path, identity: info.identity, bookmark: bookmark))
             }
-            existing.bookmark = bookmark
-            try repository.configureRoot(existing)
         } else {
             try repository.configureRoot(ManagedRoot(id: "primary", path: directory.path, identity: info.identity, bookmark: bookmark))
         }

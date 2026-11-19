@@ -8,15 +8,24 @@ target_app="$applications/WeChatFileSync.app"
 identifier="io.github.coderhanxin.wechat-file-sync"
 staging=""
 backup=""
-old_moved=0
-new_installed=0
+previous_identity=""
+staged_identity=""
+installation_complete=0
+
+app_identity() {
+    [ -d "$1" ] && [ ! -L "$1" ] && stat -f '%d:%i:%B' "$1"
+}
 
 cleanup() {
     status=$?
-    if [ "$status" -ne 0 ]; then
-        if [ "$new_installed" -eq 1 ]; then rm -rf "$target_app"; fi
-        if [ "$old_moved" -eq 1 ]; then
-            if ! mv "$backup/WeChatFileSync.app" "$target_app"; then
+    trap - EXIT INT TERM
+    if [ "$status" -ne 0 ] && [ "$installation_complete" -eq 0 ]; then
+        # Inspect actual rename results: a signal can arrive before the next shell assignment.
+        if [ -n "$staged_identity" ] && [ "$(app_identity "$target_app" || true)" = "$staged_identity" ]; then
+            rm -rf "$target_app"
+        fi
+        if [ -n "$backup" ] && [ -d "$backup/WeChatFileSync.app" ]; then
+            if [ -e "$target_app" ] || [ -L "$target_app" ] || ! mv "$backup/WeChatFileSync.app" "$target_app"; then
                 echo "旧应用仍保留在：$backup/WeChatFileSync.app，请手动移回。" >&2
                 backup=""
             fi
@@ -25,6 +34,7 @@ cleanup() {
     fi
     if [ -n "$staging" ]; then rm -rf "$staging"; fi
     if [ -n "$backup" ]; then rm -rf "$backup"; fi
+    exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -56,22 +66,32 @@ fi
 if [ -e "$target_app" ]; then
     verify_app "$target_app"
     "$target_app/Contents/MacOS/WeChatFileSync" --check-stopped
+    previous_identity="$(app_identity "$target_app")"
 fi
 mkdir -p "$applications"
 staging="$(mktemp -d "$applications/.wechat-file-sync-install.XXXXXX")"
 ditto "$source_app" "$staging/WeChatFileSync.app"
 verify_app "$staging/WeChatFileSync.app"
-if [ -e "$target_app" ]; then
+staged_identity="$(app_identity "$staging/WeChatFileSync.app")"
+if [ -n "$previous_identity" ]; then
+    if [ "$(app_identity "$target_app" || true)" != "$previous_identity" ]; then
+        echo "安装期间目标应用已变化，不覆盖。" >&2; exit 1
+    fi
+    verify_app "$target_app"
     "$target_app/Contents/MacOS/WeChatFileSync" --check-stopped
     backup="$(mktemp -d "$applications/.wechat-file-sync-backup.XXXXXX")"
     mv "$target_app" "$backup/WeChatFileSync.app"
-    old_moved=1
+elif [ -e "$target_app" ] || [ -L "$target_app" ]; then
+    echo "安装期间出现新目标，不覆盖。" >&2; exit 1
 fi
 mv "$staging/WeChatFileSync.app" "$target_app"
-new_installed=1
+if [ "$(app_identity "$target_app" || true)" != "$staged_identity" ]; then
+    echo "最终安装位置不符，保留未知目标。" >&2; exit 1
+fi
 verify_app "$target_app"
+installation_complete=1
 # Installation does not configure directories or enable a login item.
-echo "已安装到：$target_app。首次打开后在设置中配置；登录启动默认关闭。"
+echo "已安装到：${target_app}。首次打开后在设置中配置；登录启动默认关闭。"
 if ! open "$target_app"; then
     echo "应用已安装，但未能打开。请在访达中手动打开它。" >&2
 fi

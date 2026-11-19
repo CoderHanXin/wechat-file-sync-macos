@@ -149,7 +149,8 @@ func runConfiguration(_ command: Command, repository: AccountRepository) throws 
     case .reauthorizeRoot:
         guard let root = try repository.root() else { throw SyncError.message("尚未配置管理根目录") }
         activateConfigurationUI()
-        let selected = try chooseDirectory(root.url, title: "重新授权管理根目录", message: "请选择原管理根目录。M2 不更换归档位置。", requireMatch: true)
+        let canChoose = try repository.canChooseRoot()
+        let selected = try chooseDirectory(root.url, title: "管理根目录", message: canChoose ? "尚未绑定账号，可重新选择目录，不搬动文件。" : "请选择原管理根目录。此版本不搬迁归档。", requireMatch: !canChoose)
         guard selected.startAccessingSecurityScopedResource() else { throw SyncError.message("无法获得管理根目录权限") }
         defer { selected.stopAccessingSecurityScopedResource() }
         try manager.configureRoot(selected, bookmark: newBookmark(selected))

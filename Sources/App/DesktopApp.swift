@@ -8,21 +8,30 @@ private final class DesktopWorker {
     private var session: ApplicationSession?
     private var timer: DispatchSourceTimer?
     var update: ((ApplicationSnapshot?, String?) -> Void)?
+    private let makeSession: () throws -> ApplicationSession
+    private let scanInterval: TimeInterval
+
+    init(makeSession: (() throws -> ApplicationSession)? = nil, scanInterval: TimeInterval = 2) {
+        self.makeSession = makeSession ?? {
+            let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("WeChatFileSync", isDirectory: true)
+            return try ApplicationSession(database: support.appendingPathComponent("state.sqlite"),
+                rootAuthorization: { root in try securityScope(bookmark: root.bookmark, expected: root.url, identity: root.identity) },
+                sourceAuthorization: { account in
+                    let lease = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
+                    guard try isWeChatFileDirectory(lease.url) else { throw SyncError.message("微信账号目录格式错误") }
+                    return lease
+                })
+        }
+        self.scanInterval = scanInterval
+    }
 
     func start() {
         queue.async {
             do {
-                let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("WeChatFileSync", isDirectory: true)
-                self.session = try ApplicationSession(database: support.appendingPathComponent("state.sqlite"),
-                    rootAuthorization: { root in try securityScope(bookmark: root.bookmark, expected: root.url, identity: root.identity) },
-                    sourceAuthorization: { account in
-                        let lease = try securityScope(bookmark: account.sourceBookmark, expected: account.sourceURL, identity: account.sourceIdentity)
-                        guard try isWeChatFileDirectory(lease.url) else { throw SyncError.message("微信账号目录格式错误") }
-                        return lease
-                    })
+                self.session = try self.makeSession()
                 let timer = DispatchSource.makeTimerSource(queue: self.queue)
-                timer.schedule(deadline: .now(), repeating: 2)
+                timer.schedule(deadline: .now(), repeating: self.scanInterval)
                 timer.setEventHandler { [weak runtime = self] in runtime?.tick() }
                 self.timer = timer; timer.resume()
                 self.publish()
@@ -36,8 +45,15 @@ private final class DesktopWorker {
     }
 
     private func publish(error: String? = nil) {
-        let snapshot = try? session?.snapshot()
-        DispatchQueue.main.async { self.update?(snapshot, error) }
+        let snapshot: ApplicationSnapshot?
+        let message: String?
+        do { snapshot = try session?.snapshot(); message = error }
+        catch {
+            let failure = "状态读取失败，已停止同步：\(error)"
+            snapshot = nil; message = failure
+            session?.stopScanning(failure)
+        }
+        DispatchQueue.main.async { self.update?(snapshot, message) }
     }
 
     func perform<T>(_ action: @escaping (ApplicationSession) throws -> T, completion: @escaping (Result<T, Error>) -> Void) {
@@ -77,8 +93,16 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     private var selectedID: String?
     private var terminating = false
     private var receivedInitialState = false
+    private var stateUnavailable = true
+    private var stateError: String?
+    #if DESKTOP_TESTING
+    fileprivate var manualPreviewOnly = false
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DESKTOP_TESTING
+        if manualPreviewOnly { return }
+        #endif
         NSApp.setActivationPolicy(.accessory)
         makeMenu(); makeWindow()
         worker.update = { [weak self] value, error in
@@ -99,6 +123,14 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        #if DESKTOP_TESTING
+        if manualPreviewOnly {
+            NSApp.stop(nil)
+            if let event = NSEvent.otherEvent(with: .applicationDefined, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: 0, context: nil, subtype: 0, data1: 0, data2: 0) { NSApp.postEvent(event, atStart: true) }
+            return .terminateCancel // Return to the fixture so its temporary directory is removed.
+        }
+        #endif
         guard !terminating else { return .terminateLater }
         terminating = true; status.stringValue = "正在结束当前操作…"
         worker.stop { NSApp.reply(toApplicationShouldTerminate: true) }
@@ -170,8 +202,9 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     fileprivate var account: Account? { snapshot?.accounts.first { $0.id == selectedID } }
 
     fileprivate func render(_ value: ApplicationSnapshot?, error: String?) {
-        if let value { snapshot = value }
-        status.stringValue = error ?? snapshot?.message ?? "状态库不可用"
+        if let value { snapshot = value; stateUnavailable = false; stateError = error }
+        else if let error { stateUnavailable = true; stateError = error }
+        status.stringValue = busy ? "正在处理…" : stateError ?? snapshot?.message ?? "状态库不可用"
         statusItem.button?.toolTip = status.stringValue
         rootLabel.stringValue = snapshot?.root?.path ?? "未选择；首次可自定义目录，下载只是默认建议"
         let previous = selectedID
@@ -184,7 +217,7 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         selectedID = accountPicker.selectedItem?.representedObject as? String
         updateAccount()
         for button in actionButtons {
-            button.isEnabled = !busy && snapshot != nil && !terminating
+            button.isEnabled = !busy && snapshot != nil && !stateUnavailable && !terminating
             let action = button.action
             if [#selector(pauseAccount(_:)), #selector(renameAccount(_:)), #selector(authorizeAccount(_:)), #selector(removeAccount(_:)), #selector(restoreLinks(_:))].contains(where: { $0 == action }) {
                 button.isEnabled = button.isEnabled && account != nil
@@ -192,11 +225,11 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
             }
             if action == #selector(openRoot(_:)) || action == #selector(addAccount(_:)) { button.isEnabled = button.isEnabled && snapshot?.root != nil }
             if action == #selector(pauseAccount(_:)) { button.title = account?.intakeEnabled == false ? "继续同步" : "暂停新增" }
-            if action == #selector(authorizeRoot(_:)) { button.title = snapshot?.root == nil ? "选择归档目录…" : "重新授权目录…" }
+            if action == #selector(authorizeRoot(_:)) { button.title = snapshot?.root == nil ? "选择归档目录…" : snapshot?.canChooseRoot == true ? "更改归档目录…" : "重新授权目录…" }
         }
-        accountPicker.isEnabled = !busy && !terminating
-        readOnly.isEnabled = !busy && account != nil && account?.removed == false && !terminating
-        login.isEnabled = !busy && !terminating
+        accountPicker.isEnabled = !busy && !stateUnavailable && !terminating
+        readOnly.isEnabled = !busy && !stateUnavailable && account != nil && account?.removed == false && !terminating
+        login.isEnabled = !busy && !stateUnavailable && !terminating
     }
 
     private func updateAccount() {
@@ -207,15 +240,15 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     }
 
     private func perform<T>(_ action: @escaping (ApplicationSession) throws -> T, then: ((T) -> Void)? = nil) {
-        guard !busy, !terminating else { return }
-        busy = true; render(nil, error: "正在处理…")
+        guard !busy, !terminating, !stateUnavailable else { return }
+        busy = true; render(nil, error: nil)
         worker.perform(action) { [weak self] result in
             guard let self else { return }
             self.busy = false
             guard !self.terminating else { return }
             self.render(nil, error: nil)
             switch result {
-            case .success(let value): then?(value)
+            case .success(let value): if !self.stateUnavailable { then?(value) }
             case .failure(let error): _ = self.alert("操作未完成", String(describing: error))
             }
         }
@@ -233,7 +266,7 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     @objc private func selectAccount(_ sender: Any?) { selectedID = accountPicker.selectedItem?.representedObject as? String; render(nil, error: nil) }
 
     @objc private func openRoot(_ sender: Any?) {
-        guard let root = snapshot?.root else { return }
+        guard !stateUnavailable, let root = snapshot?.root else { return }
         do {
             let lease = try securityScope(bookmark: root.bookmark, expected: root.url, identity: root.identity)
             defer { withExtendedLifetime(lease) {} }
@@ -244,8 +277,9 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     @objc private func authorizeRoot(_ sender: Any?) {
         do {
             let existing = snapshot?.root
+            let canChoose = snapshot?.canChooseRoot == true
             let url = try chooseDirectory(try existing?.url ?? defaultManagedRoot(), title: "归档与跟踪目录",
-                message: existing == nil ? "选择管理根目录。文件将在其中按账号归档。" : "请选择原管理根目录以重新授权。此版本不搬迁已有归档。", requireMatch: existing != nil)
+                message: existing == nil || canChoose ? "尚未绑定账号，可选择管理根目录；不会搬动已有文件。" : "请选择原管理根目录以重新授权。此版本不搬迁已有归档。", requireMatch: existing != nil && !canChoose)
             guard url.startAccessingSecurityScopedResource() else { throw SyncError.message("未获得目录授权") }
             let lease = DirectoryLease(url: url) { url.stopAccessingSecurityScopedResource() }
             let bookmark = try newBookmark(url)
@@ -397,7 +431,7 @@ func runDesktop() {
 
 #if DESKTOP_TESTING
 /// Compiled only by test-desktop.sh; no real app support, bookmarks, login item or source access.
-func desktopPreviewTest(output: URL) throws {
+func desktopPreviewTest(output: URL, manual: Bool = false, autoClose: Bool = false) throws {
     let temporary = try canonicalDirectory(FileManager.default.temporaryDirectory).appendingPathComponent("wechat-ui-tests-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: temporary) }
     let root = temporary.appendingPathComponent("自定义资料")
@@ -412,6 +446,17 @@ func desktopPreviewTest(output: URL) throws {
     let controller = DesktopController()
     NSApp.setActivationPolicy(.accessory)
     controller.makeMenu(); controller.makeWindow(); controller.render(try session.snapshot(), error: nil)
+    if manual {
+        controller.prepareManualPreview()
+        NSApp.delegate = controller
+        controller.showSettings(nil)
+        if autoClose { DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NSApp.terminate(nil) } }
+        NSApp.run()
+        NSApp.delegate = nil
+        controller.window.close()
+        print("手动预览已退出；临时样本正在清理，未启动真实同步。")
+        return
+    }
     controller.window.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
     RunLoop.current.run(until: Date().addingTimeInterval(0.3))
@@ -441,7 +486,86 @@ func desktopPreviewTest(output: URL) throws {
     guard !controller.window.isVisible else { throw SyncError.message("设置窗口未关闭") }
     controller.showSettings(nil)
     guard controller.window.isVisible else { throw SyncError.message("设置窗口无法重新打开") }
+    controller.reviewReadFailureState(try session.snapshot())
     controller.window.close()
+    try desktopWorkerReviewTest(temporary: temporary)
     print("临时样本设置界面、自定义目录、账号状态和关闭／重开检查通过")
 }
+fileprivate extension DesktopController {
+    func prepareManualPreview() {
+        manualPreviewOnly = true
+        window.title = "微信文件同步 · 临时样本预览"
+        status.stringValue = "仅检查界面：不运行同步，不授权目录，不修改登录项。"
+        statusItem.button?.toolTip = "临时样本界面预览"
+        // Detach actions as well as disabling controls, so no chooser or service API can run.
+        for button in actionButtons + [readOnly, login] { button.isEnabled = false; button.target = nil; button.action = nil }
+        accountPicker.isEnabled = false; accountPicker.target = nil; accountPicker.action = nil
+        statusItem.menu?.autoenablesItems = false
+        if let item = statusItem.menu?.items.first(where: { $0.action == #selector(openRoot(_:)) }) {
+            item.isEnabled = false; item.target = nil; item.action = nil
+        }
+        precondition(actionButtons.allSatisfy { !$0.isEnabled && $0.action == nil })
+        precondition(!login.isEnabled && login.action == nil)
+    }
+
+    func reviewReadFailureState(_ good: ApplicationSnapshot) {
+        render(nil, error: "状态读取失败：临时注入")
+        precondition(status.stringValue.contains("状态读取失败") && !readOnly.isEnabled)
+        precondition(actionButtons.allSatisfy { !$0.isEnabled })
+        render(nil, error: nil)
+        precondition(status.stringValue.contains("状态读取失败"), "本地刷新不能将读库错误变回旧的正常状态")
+        render(good, error: nil)
+        precondition(readOnly.isEnabled && !status.stringValue.contains("状态读取失败"))
+    }
+}
+
+private func desktopWorkerReviewTest(temporary: URL) throws {
+    let root = temporary.appendingPathComponent("worker-root")
+    let source = temporary.appendingPathComponent("worker-source")
+    for url in [root, source] { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) }
+    let database = temporary.appendingPathComponent("worker-state/state.sqlite")
+    let worker = DesktopWorker(makeSession: {
+        let session = try ApplicationSession(database: database, rootAuthorization: { DirectoryLease(url: $0.url) }, sourceAuthorization: { DirectoryLease(url: $0.sourceURL) })
+        let manager = AccountManager(repository: session.store.accounts)
+        try manager.configureRoot(root, bookmark: nil)
+        _ = try manager.add(source: source, name: "queue-fixture", bookmark: nil)
+        return session
+    }, scanInterval: 60)
+    var opened = false, readFailed = false, corruptCompleted = false
+    worker.update = { value, error in
+        if value != nil { opened = true }
+        if value == nil && error?.contains("状态读取失败") == true { readFailed = true }
+    }
+    func wait(_ condition: () -> Bool) throws {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if condition() { return }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        throw SyncError.message("串行会话隔离测试等待超时")
+    }
+    worker.start()
+    try wait { opened }
+    worker.perform({ session in try session.store.accounts.execute("DROP TABLE account_settings") }) { _ in corruptCompleted = true }
+    try wait { corruptCompleted }
+    guard readFailed else { throw SyncError.message("读库错误被隐藏为旧的正常状态") }
+    let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    var actionCompleted = false, stopped = false
+    worker.perform({ session in
+        try session.store.accounts.execute("CREATE TABLE account_settings(account_id TEXT PRIMARY KEY REFERENCES accounts(id), read_only INTEGER NOT NULL CHECK(read_only IN (0,1)))")
+        started.signal()
+        guard release.wait(timeout: .now() + 5) == .success else { throw SyncError.message("测试释放超时") }
+        return true
+    }) { result in if case .success = result { actionCompleted = true } }
+    try wait { started.wait(timeout: .now()) == .success }
+    worker.stop { stopped = true }
+    precondition(!stopped)
+    release.signal()
+    try wait { stopped }
+    guard actionCompleted else { throw SyncError.message("退出没有等待已排队动作") }
+    let fresh = try ApplicationSession(database: database, rootAuthorization: { DirectoryLease(url: $0.url) }, sourceAuthorization: { DirectoryLease(url: $0.sourceURL) })
+    withExtendedLifetime(fresh) {}
+    print("临时串行会话：读库错误明确报告、退出等待动作并释放写锁检查通过")
+}
+
 #endif

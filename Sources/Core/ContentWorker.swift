@@ -69,7 +69,7 @@ final class ContentWorker {
         let recoverySources = try store.sources(accountID).filter { !$0.active && $0.endReason == .toolCleaned }
         let activeSources = try store.sources(accountID).filter { $0.active && $0.status != .conflict && $0.status != .pending }
         for entity in try store.entities(accountID) where entity.status != .pending
-            && (entity.status != .missing || activeSources.contains(where: { $0.entityID == entity.id })
+            && ((entity.status != .missing && entity.status != .conflict) || activeSources.contains(where: { $0.entityID == entity.id })
                 || (checkReturned && recoverySources.contains(where: { $0.entityID == entity.id }))) {
             try process(entity.relative) { try reconcile(entity, account: account, root: root.url, index: index) }
         }
@@ -134,14 +134,16 @@ final class ContentWorker {
     }
 
     private func reconcile(_ original: ContentEntity, account: Account, root: URL, index: ManagedRootIndex) throws {
-        guard original.status != .conflict else { return }
+        if original.status == .conflict {
+            guard try store.sources(accountID).contains(where: { $0.entityID == original.id && !$0.active && $0.endReason == .toolCleaned }) else { return }
+        }
         var entity = try locate(original, root: root, index: index)
         let target = try checkedFile(root, relative: entity.relative)
         let info = try readFileInfo(target.path)
         let available = info?.regular == true && info?.identity == entity.identity
         if available {
             let current = try OpenedContent(target, identity: entity.identity, scope: root)
-            if entity.info != info || entity.verifiedToken != current.token {
+            if entity.status == .missing || entity.status == .conflict || entity.info != info || entity.verifiedToken != current.token {
                 entity.digest = nil; entity.verifiedToken = nil; entity.info = info; entity.status = .unchecked
             }
         } else {

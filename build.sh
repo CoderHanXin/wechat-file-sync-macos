@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")" && pwd -P)"
-version="${1:-0.6.0}"
+version="${1:-0.6.1}"
 if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([.-][A-Za-z0-9.-]+)?$ ]]; then
     echo "版本号格式不正确：$version" >&2
     exit 1
