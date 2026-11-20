@@ -2,7 +2,7 @@ import Foundation
 import AppKit
 import ServiceManagement
 
-let applicationIdentifier = "io.github.coderhanxin.wechat-file-sync"
+let applicationIdentifier = "0xRock3.WechatFileSync"
 
 /// Installer helpers do not open/migrate the state database or acquire directory bookmarks.
 func checkApplicationStopped() throws {

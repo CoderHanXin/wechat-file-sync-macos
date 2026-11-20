@@ -4,7 +4,7 @@
 
 ## 数据位置与格式
 
-当前 fork 使用独立标识 `io.github.coderhanxin.wechat-file-sync`，状态位于其沙盒容器 Application Support/WeChatFileSync/state.sqlite。原作者容器和历史 WeChatDownloadSync 路径不自动读取；用户已确认本机无原版安装，未执行实际配置迁移。M1 的数据库版本为 1，M2 的 `PRAGMA user_version` 为 2，包含共享根目录、独立账号、按账号划分的历史基线和同步记录，以及未完成配置操作。
+当前 fork 使用独立标识 `0xRock3.WechatFileSync`，状态位于其沙盒容器 Application Support/WeChatFileSync/state.sqlite。标识切换和重新配置见 [部署说明](deployment.md#更换应用标识)。M1 的数据库版本为 1，M2 的 `PRAGMA user_version` 为 2，包含共享根目录、独立账号、按账号划分的历史基线和同步记录，以及未完成配置操作。
 
 应用启动或写入型配置命令先取得同一个 `sync.lock`，再打开数据库并按需迁移。修改账号前应停止后台，具体操作见 [用户指南](user-guide.md)。只读列表与 `--check` 不迁移旧格式；旧版本需由持锁的正常启动或配置命令完成升级。
 

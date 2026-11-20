@@ -113,7 +113,7 @@ final class LinkRecovery {
                 try store.atomic { try store.put(entity); try store.put(op) }
                 try checkpoint?(.planSaved)
                 try run(op)
-            } catch let error as SQLiteStoreError { throw SyncError.persistence(error.description) }
+            } catch let error as SQLiteStoreError { throw SyncError.persistenceFailure(error) }
             catch let error as SyncError {
                 if case .persistence = error { throw error }
                 results.append(ScanIssue(relative: choice.source.relative, message: error.description))

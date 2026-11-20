@@ -43,10 +43,10 @@ func runBackground(content: ContentRepository) throws {
     let root = try rootLease(repository)
     defer { withExtendedLifetime(root) {} }
     try recoverAccounts(repository)
-    let coordinator = ContentCoordinator(store: content) { account in
-        let lease = try sourceScope(account)
-        return lease
+    func makeCoordinator() -> ContentCoordinator {
+        ContentCoordinator(store: content, authorize: sourceScope)
     }
+    var coordinator = makeCoordinator()
     while true {
         do {
             let result = try coordinator.scan()
@@ -54,6 +54,9 @@ func runBackground(content: ContentRepository) throws {
                 if let error = account.error { NSLog("账号 %@ 暂停：%@", account.accountID, error) }
                 for issue in account.report?.issues ?? [] { NSLog("文件 %@ 需要检查：%@", issue.relative, issue.message) }
             }
+        } catch where isDatabaseBusy(error) {
+            coordinator = makeCoordinator()
+            NSLog("%@", ApplicationSession.databaseBusyMessage)
         } catch let error as SyncError {
             if case .persistence = error { throw error }
             NSLog("同步检查失败：%@", error.description)

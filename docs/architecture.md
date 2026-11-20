@@ -189,7 +189,7 @@ M3 自动维护共享实体位置和来源，失联后保留记录并清理仍�
 
 `DesktopController` 提供菜单栏和一个设置窗口，关闭窗口继续运行；退出回调等待队列结束当前动作并释放会话。不另加后台服务。原身份自动恢复与副本恢复都复用 M4 的 LinkRecovery，预览不持久化，源占用不覆盖。失联链接先排他移到已记录临时位置，核对实际对象再清理，替换内容不盲删。
 
-独立标识为 `io.github.coderhanxin.wechat-file-sync`，配置位于对应沙盒容器的 Application Support/WeChatFileSync。构建目标仍为 macOS 13+；CLI 与 UI 共用连接规则和写锁，只有纯查询可与正在运行的应用并存。
+独立标识为 `0xRock3.WechatFileSync`，配置位于对应沙盒容器的 Application Support/WeChatFileSync。构建目标仍为 macOS 13+；CLI 与 UI 共用连接规则和写锁，只有纯查询可与正在运行的应用并存。
 
 登录启动由设置中的 `SMAppService.mainApp` 显式开关控制。安装脚本只复制应用、不配置、不注册服务；升级要求先退出，验证 staging 后替换，失败回滚；卸载注销登录启动后只移除应用，保留数据。细节和未覆盖真实流程见 [桌面与部署方案](desktop-app-plan.md)、[部署说明](deployment.md) 与 [验收记录](validation-report.md)。
 

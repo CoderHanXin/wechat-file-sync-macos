@@ -42,7 +42,9 @@ private final class DesktopWorker {
     }
 
     private func tick() {
-        do { try session?.scan(); publish() }
+        guard let session else { return }
+        do { try session.scan(); publish() }
+        catch where isDatabaseBusy(error) { publish() }
         catch { publish(error: String(describing: error)) }
     }
 
@@ -50,6 +52,10 @@ private final class DesktopWorker {
         let snapshot: ApplicationSnapshot?
         let message: String?
         do { snapshot = try session?.snapshot(); message = error }
+        catch where isDatabaseBusy(error) {
+            snapshot = nil; message = ApplicationSession.databaseBusyMessage
+            session?.waitForDatabase()
+        }
         catch {
             let failure = "状态读取失败，已停止同步：\(error)"
             snapshot = nil; message = failure
@@ -64,7 +70,10 @@ private final class DesktopWorker {
             do {
                 guard let session = self.session else { throw SyncError.message("状态库未打开，请退出后重试；可能有另一个实例正在运行") }
                 result = .success(try action(session))
-            } catch { result = .failure(error) }
+            } catch {
+                if isDatabaseBusy(error) { self.session?.waitForDatabase() }
+                result = .failure(error)
+            }
             self.publish()
             DispatchQueue.main.async { completion(result) }
         }
@@ -78,17 +87,64 @@ private final class DesktopWorker {
     }
 }
 
-fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    private let worker = DesktopWorker()
+fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate {
+    fileprivate static let defaultSettingsSize = NSSize(width: 960, height: 620)
+    private static let minimumSettingsSize = NSSize(width: 880, height: 600)
+
+    private let worker: DesktopWorker
+    private let makeBookmark: (URL) throws -> Data
+    private let resolveBookmark: (Data) throws -> DirectoryLease
     private var statusItem: NSStatusItem!
+    private let menuStatus = NSMenuItem(title: "等待检查", action: nil, keyEquivalent: "")
+    private let menuProblem = NSMenuItem(title: "查看同步问题", action: #selector(showSyncProblem(_:)), keyEquivalent: "")
+    private let menuOpenRoot = NSMenuItem(title: "打开文件保存位置", action: #selector(openRoot(_:)), keyEquivalent: "")
     fileprivate var window: NSWindow!
-    private let status = NSTextField(wrappingLabelWithString: "正在打开状态库…")
+    private let status = NSTextField(labelWithString: "等待检查")
+    private let statusDot = NSImageView()
+    private var accountStatus: NSStackView!
     private let rootLabel = NSTextField(wrappingLabelWithString: "尚未选择文件夹")
+    private let rootFeedback = NSTextField(wrappingLabelWithString: "")
+    private var rootSelectionError: String?
     private let accountPicker = NSPopUpButton()
     private let accountInfo = NSTextField(wrappingLabelWithString: "添加账号后，只同步之后收到的新文件。")
     fileprivate let readOnly = NSSwitch()
     fileprivate let syncSwitch = NSSwitch()
     private let more = NSPopUpButton(frame: .zero, pullsDown: true)
+    private var managedAccountGroup: NSView!
+    private var setupGroup: NSView!
+    private var syncSection: NSView!
+    private var folderSection: NSView!
+    private var storageSection: NSView!
+    private var allowWeChat: NSButton!
+    private var reauthorizeWeChat: NSButton!
+    private var addAccountButton: NSButton!
+    private let addPopover = NSPopover()
+    private let addList = NSStackView()
+    private let addScroll = NSScrollView()
+    private let addHint = NSTextField(wrappingLabelWithString: "")
+    private let addFeedback = NSTextField(wrappingLabelWithString: "")
+    private var addBody: NSStackView!
+    private var addScrollHeight: NSLayoutConstraint!
+    private var allowAddAccess: NSButton!
+    private var returningFromAddAuthorization = false
+    private var addEscapeMonitor: Any?
+    private let setupHint = NSTextField(wrappingLabelWithString: "")
+    private let setupFeedback = NSTextField(wrappingLabelWithString: "")
+    private let draftPath = NSTextField(labelWithString: "")
+    private var draftDestination: NSView!
+    private var chooseDraftDestination: NSButton!
+    private var startSync: NSButton!
+    private var cancelSetup: NSButton!
+    private let candidateList = NSStackView()
+    private var candidateButtons: [NSButton] = []
+    private var visibleCandidates: [DiscoveredAccount] = []
+    private var candidateButtonsAddDirectly = false
+    private var addingAccount = false
+    private var parentGrant: DirectoryLease?
+    private var discoveredAccounts: [DiscoveredAccount] = []
+    private var draftAccount: DiscoveredAccount?
+    private var draftRoot: DirectoryLease?
+    private var setupError: String?
     private var accountPage: NSStackView!
     private var generalPage: NSStackView!
     private var navigation: [NSButton] = []
@@ -109,6 +165,18 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     fileprivate var manualPreviewOnly = false
     #endif
 
+    fileprivate init(worker: DesktopWorker = DesktopWorker(), makeBookmark: @escaping (URL) throws -> Data = newBookmark,
+                     resolveBookmark: @escaping (Data) throws -> DirectoryLease = bookmarkScope) {
+        self.worker = worker
+        self.makeBookmark = makeBookmark
+        self.resolveBookmark = resolveBookmark
+        super.init()
+    }
+
+    deinit {
+        if let addEscapeMonitor { NSEvent.removeMonitor(addEscapeMonitor) }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DESKTOP_TESTING
         if manualPreviewOnly { return }
@@ -120,7 +188,7 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
             self.render(value, error: error)
             if !self.receivedInitialState {
                 self.receivedInitialState = true
-                if value?.root == nil || error != nil { self.showSettings(nil) }
+                if value?.root == nil || value?.accounts.isEmpty == true || error != nil { self.showSettings(nil) }
             }
         }
         worker.start()
@@ -132,6 +200,10 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    func windowWillClose(_ notification: Notification) {
+        if addPopover.isShown { addPopover.close() }
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         #if DESKTOP_TESTING
         if manualPreviewOnly {
@@ -142,7 +214,7 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         }
         #endif
         guard !terminating else { return .terminateLater }
-        terminating = true; status.stringValue = "正在结束当前操作…"
+        terminating = true; updateSyncStatus()
         worker.stop { NSApp.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
     }
@@ -151,13 +223,18 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "tray.and.arrow.down", accessibilityDescription: "微信文件同步")
         let menu = NSMenu()
-        for (title, selector) in [("设置…", #selector(showSettings(_:))), ("打开文件保存位置", #selector(openRoot(_:))), ("退出", #selector(quit(_:)))] {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: title == "退出" ? "q" : "")
-            item.target = self; menu.addItem(item)
-        }
+        menu.autoenablesItems = false
+        menuStatus.isEnabled = false; menu.addItem(menuStatus)
+        menuProblem.target = self; menuProblem.isHidden = true; menu.addItem(menuProblem)
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "设置", action: #selector(showSettings(_:)), keyEquivalent: ",").target = self
+        menuOpenRoot.target = self; menuOpenRoot.isEnabled = false; menu.addItem(menuOpenRoot)
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "退出", action: #selector(quit(_:)), keyEquivalent: "q").target = self
         statusItem.menu = menu
         let main = NSMenu(), app = NSMenu(), item = NSMenuItem()
         item.submenu = app; main.addItem(item)
+        app.addItem(withTitle: "设置", action: #selector(showSettings(_:)), keyEquivalent: ",").target = self
         app.addItem(withTitle: "退出微信文件同步", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let edit = NSMenu(), editItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
         for (name, action, key) in [("剪切", #selector(NSText.cut(_:)), "x"), ("复制", #selector(NSText.copy(_:)), "c"), ("粘贴", #selector(NSText.paste(_:)), "v"), ("全选", #selector(NSText.selectAll(_:)), "a")] {
@@ -175,7 +252,7 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         case #selector(removeAccount(_:)): button.toolTip = "停止同步和文件位置更新，保留文件，不删除微信账号。"
         case #selector(restoreLinks(_:)): button.toolTip = "原文件放回保存位置后会自动恢复。找回另一份副本时，可在这里选择。"
         case #selector(authorizeRoot(_:)): button.toolTip = "选择保存文件的位置；已有账号时只能重新选择原文件夹以恢复访问。"
-        case #selector(addAccount(_:)): button.toolTip = "选择一个微信账号的文件夹，只同步之后收到的新文件。"
+        case #selector(addAccount(_:)): button.toolTip = "查看还可以添加哪些微信账号。"
         default: break
         }
         actionButtons.append(button); return button
@@ -218,10 +295,12 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         return box
     }
 
-    private func section(_ title: String, _ content: NSView, note: String? = nil) -> NSStackView {
+    private func section(_ title: String, _ content: NSView, note: String? = nil, trailing: NSView? = nil) -> NSStackView {
         let heading = NSTextField(labelWithString: title); heading.font = .systemFont(ofSize: 12, weight: .semibold)
         heading.textColor = .secondaryLabelColor
-        let stack = column([heading, content], spacing: 10)
+        let header: NSView = trailing.map { row(heading, spacer(), $0) } ?? heading
+        let stack = column([header, content], spacing: 10)
+        if trailing != nil { header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
         content.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         if let note {
             let label = NSTextField(wrappingLabelWithString: note); label.font = .systemFont(ofSize: 11)
@@ -245,15 +324,60 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         return row(text, spacer(), control)
     }
 
+    private func makeAddPopover() {
+        let width: CGFloat = 360
+        let board = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 100))
+        let title = NSTextField(labelWithString: "添加微信账号")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        for hint in [addHint, addFeedback] {
+            hint.font = .systemFont(ofSize: 12)
+            hint.textColor = .secondaryLabelColor
+            hint.preferredMaxLayoutWidth = width - 32
+        }
+        allowAddAccess = button("允许访问微信文件夹…", #selector(allowWeChatAccess(_:)))
+        addList.orientation = .vertical; addList.alignment = .leading; addList.spacing = 8
+        addList.translatesAutoresizingMaskIntoConstraints = false
+        let document = SettingsDocument()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(addList)
+        addScroll.documentView = document
+        addScroll.drawsBackground = false; addScroll.hasVerticalScroller = true; addScroll.autohidesScrollers = true
+        addScroll.borderType = .noBorder
+        addScrollHeight = addScroll.heightAnchor.constraint(equalToConstant: 0)
+        addBody = column([title, addHint, addFeedback, allowAddAccess, addScroll], spacing: 10)
+        addBody.translatesAutoresizingMaskIntoConstraints = false
+        board.addSubview(addBody)
+        NSLayoutConstraint.activate([addBody.leadingAnchor.constraint(equalTo: board.leadingAnchor, constant: 16),
+            addBody.trailingAnchor.constraint(equalTo: board.trailingAnchor, constant: -16),
+            addBody.topAnchor.constraint(equalTo: board.topAnchor, constant: 16),
+            addScroll.widthAnchor.constraint(equalTo: addBody.widthAnchor), addScrollHeight,
+            addHint.widthAnchor.constraint(equalTo: addBody.widthAnchor),
+            addFeedback.widthAnchor.constraint(equalTo: addBody.widthAnchor),
+            document.widthAnchor.constraint(equalTo: addScroll.contentView.widthAnchor),
+            addList.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            addList.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -4),
+            addList.topAnchor.constraint(equalTo: document.topAnchor),
+            addList.bottomAnchor.constraint(equalTo: document.bottomAnchor)])
+        let content = NSViewController(); content.view = board
+        addPopover.contentViewController = content
+        addPopover.contentSize = board.frame.size
+        addPopover.behavior = .transient; addPopover.delegate = self
+        addPopover.animates = false
+    }
+
     fileprivate func makeWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 720),
+        window = NSWindow(contentRect: NSRect(origin: .zero, size: Self.defaultSettingsSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
-        window.minSize = NSSize(width: 880, height: 680)
+        window.minSize = Self.minimumSettingsSize
         window.title = "微信文件同步 · 设置"; window.titleVisibility = .hidden; window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false; window.delegate = self; window.center()
         window.backgroundColor = .textBackgroundColor
         status.font = .systemFont(ofSize: 11); status.textColor = .secondaryLabelColor
-        for label in [rootLabel, accountInfo] {
+        statusDot.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
+        statusDot.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 7, weight: .regular)
+        statusDot.setAccessibilityElement(false)
+        accountStatus = row(statusDot, status); accountStatus.spacing = 6
+        for label in [rootLabel, accountInfo, draftPath] {
             label.isSelectable = true; label.font = .systemFont(ofSize: 11); label.textColor = .secondaryLabelColor
             label.maximumNumberOfLines = 1; label.lineBreakMode = .byTruncatingMiddle
             label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -269,30 +393,66 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         loginStatus.font = .systemFont(ofSize: 11); loginStatus.textColor = .secondaryLabelColor
         more.bezelStyle = .roundRect; more.controlSize = .small; more.font = .systemFont(ofSize: 12)
         more.addItem(withTitle: "更多操作")
-        for (title, action) in [("恢复文件关联…", #selector(restoreLinks(_:))), ("重新选择微信文件夹…", #selector(authorizeAccount(_:))), ("停止管理此账号…", #selector(removeAccount(_:)))] {
+        for (title, action) in [("恢复文件关联…", #selector(restoreLinks(_:))), ("恢复管理此账号…", #selector(authorizeAccount(_:))), ("停止管理此账号…", #selector(removeAccount(_:)))] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; more.menu?.addItem(item)
         }
         more.menu?.autoenablesItems = false
-        let accountGroup = group([settingRow("当前账号", control: accountPicker),
-            row(button("添加账号…", #selector(addAccount(_:))), more, spacer())])
-        let syncGroup = group([settingRow("同步新文件", detail: "关闭后，仍会更新已有文件的位置。", control: syncSwitch),
-            settingRow("新文件只读", detail: "编辑时，建议另存为新文件。", control: readOnly)])
+        addAccountButton = button("添加账号", #selector(addAccount(_:)))
+        makeAddPopover()
+        reauthorizeWeChat = button("重新允许访问…", #selector(authorizeAccount(_:)))
+        managedAccountGroup = group([settingRow("当前账号", control: accountPicker),
+            row(addAccountButton, reauthorizeWeChat, more, spacer())])
+        allowWeChat = button("允许访问微信文件夹…", #selector(allowWeChatAccess(_:)))
+        chooseDraftDestination = button("选择保存位置…", #selector(chooseSetupRoot(_:)))
+        startSync = button("开始同步", #selector(startFirstSync(_:)))
+        startSync.bezelStyle = .rounded
+        cancelSetup = button("取消设置", #selector(cancelAccountSetup(_:)))
+        candidateList.orientation = .vertical
+        candidateList.alignment = .leading
+        candidateList.spacing = 8
+        setupHint.font = .systemFont(ofSize: 11)
+        setupHint.textColor = .secondaryLabelColor
+        let draftLocation = column([NSTextField(labelWithString: "文件保存位置"), draftPath], spacing: 4)
+        draftPath.widthAnchor.constraint(equalTo: draftLocation.widthAnchor).isActive = true
+        draftDestination = row(draftLocation, spacer(), chooseDraftDestination)
+        let setupBody = column([setupHint, allowWeChat, candidateList, draftDestination,
+            row(startSync, cancelSetup, spacer())], spacing: 12)
+        for view in [setupHint, candidateList, draftDestination!] as [NSView] {
+            view.widthAnchor.constraint(equalTo: setupBody.widthAnchor).isActive = true
+        }
+        setupGroup = group([setupBody])
+        setupFeedback.font = .systemFont(ofSize: 12)
+        setupFeedback.textColor = .secondaryLabelColor
+        setupFeedback.maximumNumberOfLines = 2
+        let accountGroups = column([managedAccountGroup, setupGroup, setupFeedback], spacing: 12)
+        managedAccountGroup.widthAnchor.constraint(equalTo: accountGroups.widthAnchor).isActive = true
+        setupGroup.widthAnchor.constraint(equalTo: accountGroups.widthAnchor).isActive = true
+        setupFeedback.widthAnchor.constraint(equalTo: accountGroups.widthAnchor).isActive = true
+        let syncGroup = group([settingRow("同步新文件", detail: "开启后，自动保存微信新收到的文件。", control: syncSwitch),
+            settingRow("文件只读", detail: "新保存的文件设为只读。需要编辑时，请另存一份。", control: readOnly)])
         let folderTitle = NSTextField(labelWithString: "账号文件夹"); folderTitle.font = .systemFont(ofSize: 13)
         let folderContent = column([folderTitle, accountInfo], spacing: 5)
         accountInfo.widthAnchor.constraint(equalTo: folderContent.widthAnchor).isActive = true
         let folderGroup = group([folderContent, row(button("在 Finder 中打开", #selector(openAccountFolder(_:))), spacer())])
-        accountPage = column([section("微信账号", accountGroup), section("文件同步", syncGroup),
-            section("文件位置", folderGroup, note: "可在保存范围内整理文件；本工具不备份内容。"), status], spacing: 28)
+        syncSection = section("文件同步", syncGroup)
+        folderSection = section("文件位置", folderGroup, note: "在保存范围内改名或移动文件，微信里的文件链接会自动更新。")
+        accountPage = column([section("微信账号", accountGroups, trailing: accountStatus), syncSection, folderSection], spacing: 28)
         let rootTitle = NSTextField(labelWithString: "文件保存位置"); rootTitle.font = .systemFont(ofSize: 13)
-        let rootContent = column([rootTitle, rootLabel], spacing: 5)
-        rootLabel.widthAnchor.constraint(equalTo: rootContent.widthAnchor).isActive = true
+        rootFeedback.font = .systemFont(ofSize: 12)
+        rootFeedback.textColor = .secondaryLabelColor
+        rootFeedback.isHidden = true
+        let rootContent = column([rootTitle, rootLabel, rootFeedback], spacing: 5)
+        for label in [rootLabel, rootFeedback] {
+            label.widthAnchor.constraint(equalTo: rootContent.widthAnchor).isActive = true
+        }
         let rootGroup = group([rootContent,
             row(button("选择保存文件夹…", #selector(authorizeRoot(_:))), button("在 Finder 中打开", #selector(openRoot(_:))), spacer())])
         let loginText = column([NSTextField(labelWithString: "登录时启动"), loginStatus], spacing: 3)
         login.controlSize = .small; login.setAccessibilityLabel("登录时启动")
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "开发版"
         let versionLabel = NSTextField(labelWithString: version); versionLabel.font = .systemFont(ofSize: 12); versionLabel.textColor = .secondaryLabelColor
-        generalPage = column([section("存储", rootGroup, note: "不同账号分别保存，改名或移动后仍可从微信打开。"),
+        storageSection = section("存储", rootGroup, note: "不同账号分别保存，文件改名或移动后仍可从微信打开。")
+        generalPage = column([storageSection,
             section("启动", group([row(loginText, spacer(), login)])),
             section("关于", group([settingRow("微信文件同步", detail: "保存微信新文件，维护原消息中的文件关联。", control: versionLabel)]))], spacing: 28)
         let side = SettingsSurface(.sidebar)
@@ -328,8 +488,8 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         NSLayoutConstraint.activate([outer.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor),
             outer.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor), outer.topAnchor.constraint(equalTo: window.contentView!.topAnchor),
             outer.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
-            window.contentView!.widthAnchor.constraint(greaterThanOrEqualToConstant: 880),
-            window.contentView!.heightAnchor.constraint(greaterThanOrEqualToConstant: 680), side.widthAnchor.constraint(equalToConstant: 200),
+            window.contentView!.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.minimumSettingsSize.width),
+            window.contentView!.heightAnchor.constraint(greaterThanOrEqualToConstant: Self.minimumSettingsSize.height), side.widthAnchor.constraint(equalToConstant: 200),
             body.widthAnchor.constraint(equalTo: window.contentView!.widthAnchor, constant: -200),
             sideStack.leadingAnchor.constraint(equalTo: side.leadingAnchor, constant: 10), sideStack.trailingAnchor.constraint(equalTo: side.trailingAnchor, constant: -10),
             sideStack.topAnchor.constraint(equalTo: side.topAnchor, constant: 58),
@@ -344,6 +504,7 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
 
     private var pageHeight: NSLayoutConstraint?
     private func showPage(_ index: Int) {
+        if index != 0 && addPopover.isShown { addPopover.close() }
         pageTitle.stringValue = index == 0 ? "账号与文件" : "通用"
         pageHeight?.isActive = false
         let page = index == 0 ? accountPage! : generalPage!
@@ -360,16 +521,24 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     fileprivate func render(_ value: ApplicationSnapshot?, error: String?) {
         if let value { snapshot = value; stateUnavailable = false; stateError = error }
         else if let error { stateUnavailable = true; stateError = error }
-        status.stringValue = busy ? "正在处理…" : stateError ?? snapshot?.message ?? "状态库不可用"
-        statusItem.button?.toolTip = status.stringValue
+        updateSyncStatus()
         rootLabel.stringValue = snapshot?.root?.path ?? "请选择用于保存微信文件的文件夹"
         rootLabel.toolTip = snapshot?.root.map { "\($0.path)\n程序只在这个文件夹内查找改名或移动后的文件。" }
+        let rootIssue = rootSelectionError ?? (savingLocationUnavailable ? "无法访问保存位置，请重新选择原文件夹。" : nil)
+        rootFeedback.stringValue = rootIssue ?? ""
+        rootFeedback.toolTip = rootSelectionError ?? (savingLocationUnavailable ? snapshot?.message : nil)
+        rootFeedback.isHidden = rootIssue == nil
         let previous = selectedID
         let accounts = snapshot?.accounts ?? []
-        let titles = accounts.map { WeChatDirectories.displayName(source: $0.sourceURL) + ($0.removed ? "（已停止管理）" : "") }
+        let titles = accounts.map { account in
+            let name = WeChatDirectories.displayName(source: account.sourceURL)
+            if account.removed { return name + "（已停止管理）" }
+            if !stateUnavailable && snapshot?.accountIssues[account.id] != nil { return name + "（需要处理）" }
+            return name
+        }
         let menuChanged = accountPicker.itemArray.count != accounts.count || zip(accountPicker.itemArray, accounts).contains {
             $0.0.representedObject as? String != $0.1.id
-        } || accountPicker.itemTitles != titles
+        }
         // Periodic status updates must not replace a menu while the user is selecting an account.
         if menuChanged {
             accountPicker.removeAllItems()
@@ -378,6 +547,8 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
                 accountPicker.lastItem?.representedObject = account.id
             }
             if let previous, let index = accounts.firstIndex(where: { $0.id == previous }) { accountPicker.selectItem(at: index) }
+        } else {
+            for (item, title) in zip(accountPicker.itemArray, titles) where item.title != title { item.title = title }
         }
         selectedID = accountPicker.selectedItem?.representedObject as? String
         updateAccount()
@@ -385,19 +556,19 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
             button.isEnabled = !busy && snapshot != nil && !stateUnavailable && !terminating
             let action = button.action
             if action == #selector(openAccountFolder(_:)) { button.isEnabled = button.isEnabled && account != nil && account?.removed == false }
-            if action == #selector(openRoot(_:)) { button.isEnabled = button.isEnabled && snapshot?.root != nil }
+            if action == #selector(openRoot(_:)) { button.isEnabled = button.isEnabled && menuOpenRoot.isEnabled }
             if action == #selector(authorizeRoot(_:)) {
                 button.title = snapshot?.root == nil ? "选择保存文件夹…" : snapshot?.canChooseRoot == true ? "更改保存位置…" : "重新选择保存文件夹…"
             }
         }
-        accountPicker.isEnabled = !busy && !stateUnavailable && !terminating && !(snapshot?.accounts.isEmpty ?? true)
-        let editable = !busy && !stateUnavailable && !terminating
+        let editable = !busy && !stateUnavailable && !terminating && snapshot != nil
+        accountPicker.isEnabled = editable && !accounts.isEmpty
         syncSwitch.isEnabled = editable && account != nil && account?.removed == false
         more.isEnabled = editable && account != nil
         for item in more.menu?.items.dropFirst() ?? [] {
             item.isEnabled = editable && account != nil
             if item.action == #selector(authorizeAccount(_:)) {
-                item.title = account?.removed == true ? "恢复管理此账号…" : "重新选择微信文件夹…"
+                item.isHidden = account?.removed != true
             } else {
                 item.isEnabled = item.isEnabled && account?.removed == false
                 if item.action == #selector(restoreLinks(_:)) { item.isEnabled = item.isEnabled && !(snapshot?.recoverable[account?.id ?? ""] ?? []).isEmpty }
@@ -405,6 +576,127 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         }
         readOnly.isEnabled = !busy && !stateUnavailable && account != nil && account?.removed == false && !terminating
         login.isEnabled = !busy && !stateUnavailable && !terminating
+        renderAccountSetup(accounts: accounts, editable: editable)
+    }
+
+    private var savingLocationUnavailable: Bool {
+        !stateUnavailable && snapshot?.syncStatus == .savingLocationUnavailable
+    }
+
+    private func updateSyncStatus() {
+        let syncStatus = snapshot?.syncStatus ?? .waiting
+        var color = NSColor.tertiaryLabelColor
+        var hasProblem = false
+        if terminating { status.stringValue = "正在结束当前操作…" }
+        else if busy { status.stringValue = "正在处理…" }
+        else if stateError == ApplicationSession.databaseBusyMessage { status.stringValue = "正在重试" }
+        else if stateError != nil && !savingLocationUnavailable {
+            status.stringValue = "需要处理"; hasProblem = true
+        } else {
+            switch syncStatus {
+            case .waiting:
+                let configured = snapshot?.root != nil && snapshot?.accounts.contains { !$0.removed } == true
+                status.stringValue = snapshot == nil || configured ? "等待检查" : "等待设置"
+            case .idle: status.stringValue = "等待新文件"; color = .systemGreen
+            case .processing: status.stringValue = "正在处理新文件"
+            case .paused: status.stringValue = "新文件同步已暂停"
+            case .retrying: status.stringValue = "正在重试"
+            case .needsAttention:
+                let count = snapshot?.accountIssues.count ?? 0
+                status.stringValue = count == 0 ? "需要处理" : "\(count) 个账号需要处理"
+                hasProblem = true
+            case .savingLocationUnavailable:
+                status.stringValue = "无法访问保存位置"; hasProblem = true
+            }
+        }
+        if hasProblem { color = .systemOrange }
+        statusDot.contentTintColor = color
+        status.toolTip = stateError ?? snapshot?.message
+        if menuStatus.title != status.stringValue { menuStatus.title = status.stringValue }
+        menuProblem.isHidden = !hasProblem
+        menuOpenRoot.isEnabled = !stateUnavailable && !savingLocationUnavailable && !busy && !terminating && snapshot?.root != nil
+        statusItem.button?.toolTip = status.toolTip ?? status.stringValue
+    }
+
+    private func renderAccountSetup(accounts: [Account], editable: Bool) {
+        let firstSetup = accounts.isEmpty
+        managedAccountGroup.isHidden = firstSetup
+        syncSection.isHidden = firstSetup
+        folderSection.isHidden = firstSetup
+        storageSection.isHidden = snapshot?.root == nil
+        setupGroup.isHidden = !firstSetup
+        reauthorizeWeChat.isHidden = stateUnavailable || (account.map { snapshot?.unavailableSources.contains($0.id) != true || $0.removed } ?? true)
+        let accountIssue = account.flatMap { snapshot?.accountIssues[$0.id] }
+        let generalIssue: String?
+        if case .retrying? = snapshot?.syncStatus {
+            generalIssue = snapshot?.message
+        } else if case .needsAttention? = snapshot?.syncStatus, snapshot?.accountIssues.isEmpty == true {
+            generalIssue = snapshot?.message
+        } else { generalIssue = nil }
+        let accountDetail = reauthorizeWeChat.isHidden ? accountIssue : "无法访问此账号的微信文件夹。"
+        let detail = (!addingAccount ? setupError : nil) ?? (savingLocationUnavailable ? nil : stateError ?? accountDetail ?? generalIssue)
+        setupFeedback.stringValue = detail ?? ""
+        setupFeedback.toolTip = detail == accountDetail ? accountIssue ?? detail : detail
+        setupFeedback.isHidden = detail == nil
+
+        allowWeChat.isHidden = parentGrant != nil || busy
+        setupHint.stringValue = parentGrant == nil ? "允许访问微信文件夹后，即可选择要同步的账号。" : "选择要同步的账号。已有文件留在原处。"
+        let available = discoveredAccounts.filter { candidate in
+            !accounts.contains { $0.source == candidate.source.path || $0.sourceIdentity == candidate.identity }
+        }
+        if parentGrant != nil && available.isEmpty { setupHint.stringValue = "没有可添加的微信账号。" }
+        if busy && parentGrant == nil { setupHint.stringValue = "正在查找微信账号…" }
+        let addDirectly = !firstSetup
+        if visibleCandidates != available || candidateButtonsAddDirectly != addDirectly {
+            visibleCandidates = available
+            candidateButtonsAddDirectly = addDirectly
+            for view in candidateList.arrangedSubviews + addList.arrangedSubviews { view.removeFromSuperview() }
+            let list = addDirectly ? addList : candidateList
+            candidateButtons = available.map { candidate in
+                let button = NSButton(title: firstSetup ? "选择" : "添加", target: self, action: #selector(chooseCandidate(_:)))
+                button.bezelStyle = .roundRect
+                button.controlSize = .small
+                let name = NSTextField(labelWithString: candidate.name)
+                name.lineBreakMode = .byTruncatingMiddle
+                name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                name.toolTip = candidate.name
+                let candidateRow = row(name, spacer(), button)
+                list.addArrangedSubview(candidateRow)
+                candidateRow.widthAnchor.constraint(equalTo: list.widthAnchor).isActive = true
+                return button
+            }
+        }
+        for (button, candidate) in zip(candidateButtons, available) {
+            let selected = candidate == draftAccount && firstSetup
+            button.title = firstSetup ? (selected ? "已选择" : "选择") : "添加"
+            button.setAccessibilityLabel("\(button.title) \(candidate.name)")
+            button.isEnabled = editable && !selected
+        }
+        candidateList.isHidden = available.isEmpty || !firstSetup
+        let destination = (draftRoot?.url ?? snapshot?.root?.url)?.path
+        draftPath.stringValue = destination ?? "尚未选择文件夹"
+        draftPath.toolTip = destination
+        chooseDraftDestination.title = destination == nil ? "选择保存位置…" : "更改保存位置…"
+        chooseDraftDestination.isEnabled = editable && (snapshot?.canChooseRoot == true || snapshot?.root == nil)
+        draftDestination.isHidden = !firstSetup || draftAccount == nil
+        startSync.isHidden = !firstSetup || draftAccount == nil
+        startSync.isEnabled = editable && draftAccount != nil && destination != nil
+        cancelSetup.isHidden = parentGrant == nil
+        if addingAccount { renderAddPopover(hasCandidates: !available.isEmpty) }
+    }
+
+    private func renderAddPopover(hasCandidates: Bool) {
+        let loading = busy && parentGrant == nil
+        addHint.stringValue = loading ? "正在查找微信账号…" :
+            parentGrant == nil ? "允许访问微信文件夹后，可查看可添加的账号。" : "没有可添加的微信账号。"
+        addHint.isHidden = hasCandidates
+        addFeedback.stringValue = setupError ?? ""
+        addFeedback.isHidden = setupError == nil
+        allowAddAccess.isHidden = parentGrant != nil || loading
+        addScroll.isHidden = !hasCandidates
+        addScrollHeight.constant = min(addList.fittingSize.height, 200)
+        let size = NSSize(width: 360, height: 32 + addBody.fittingSize.height)
+        if addPopover.contentSize != size { addPopover.contentSize = size }
     }
 
     private func updateAccount() {
@@ -420,7 +712,8 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         }
     }
 
-    private func perform<T>(_ action: @escaping (ApplicationSession) throws -> T, then: ((T) -> Void)? = nil) {
+    private func perform<T>(_ action: @escaping (ApplicationSession) throws -> T, then: ((T) -> Void)? = nil,
+                            onError: ((String) -> Void)? = nil) {
         guard !busy, !terminating, !stateUnavailable else { return }
         busy = true; render(nil, error: nil)
         worker.perform(action) { [weak self] result in
@@ -430,7 +723,9 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
             self.render(nil, error: nil)
             switch result {
             case .success(let value): if !self.stateUnavailable { then?(value) }
-            case .failure(let error): _ = self.alert("操作未完成", String(describing: error))
+            case .failure(let error):
+                if let onError { onError(String(describing: error)) }
+                else { _ = self.alert("操作未完成", String(describing: error)) }
             }
         }
     }
@@ -445,13 +740,38 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
     @objc fileprivate func showSettings(_ sender: Any?) {
         window.makeKeyAndOrderFront(nil)
         if !hasShownSettings {
-            window.setContentSize(NSSize(width: 960, height: 720))
+            window.setContentSize(Self.defaultSettingsSize)
             window.center(); hasShownSettings = true
         }
         NSApp.activate(ignoringOtherApps: true); refreshLogin()
     }
     @objc private func quit(_ sender: Any?) { NSApp.terminate(nil) }
-    @objc private func selectAccount(_ sender: Any?) { selectedID = accountPicker.selectedItem?.representedObject as? String; render(nil, error: nil) }
+    @objc private func selectAccount(_ sender: Any?) {
+        let selected = accountPicker.selectedItem?.representedObject as? String
+        if selectedID != selected { setupError = nil }
+        selectedID = selected
+        render(nil, error: nil)
+    }
+
+    @objc private func showSyncProblem(_ sender: Any?) {
+        guard !menuProblem.isHidden else { return }
+        if addPopover.isShown { addPopover.close() }
+        if savingLocationUnavailable {
+            showPage(1)
+        } else {
+            setupError = nil
+            if !stateUnavailable && stateError == nil, let snapshot, snapshot.accountIssues[selectedID ?? ""] == nil,
+               let item = accountPicker.itemArray.first(where: { item in
+                   guard let id = item.representedObject as? String else { return false }
+                   return snapshot.accountIssues[id] != nil
+               }) {
+                accountPicker.select(item)
+            }
+            selectAccount(nil)
+            showPage(0)
+        }
+        showSettings(nil)
+    }
 
     @objc private func openRoot(_ sender: Any?) {
         guard !stateUnavailable, let root = snapshot?.root else { return }
@@ -462,17 +782,60 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         } catch { _ = alert("无法打开目录", String(describing: error)) }
     }
 
-    @objc private func authorizeRoot(_ sender: Any?) {
+    private func showDirectorySheet(suggested: @autoclosure () throws -> URL, title: String, message: String,
+                                    onDismiss: (() -> Void)? = nil,
+                                    onError: ((String) -> Void)? = nil, onSelection: @escaping (URL) throws -> Void) {
+        guard !busy, !terminating, !stateUnavailable, window.attachedSheet == nil else { return }
+        let reportError = onError ?? { [weak self] in self?.showSetupError($0) }
         do {
-            let existing = snapshot?.root
-            let canChoose = snapshot?.canChooseRoot == true
-            let url = try chooseDirectory(try existing?.url ?? defaultManagedRoot(), title: "文件保存位置",
-                message: existing == nil || canChoose ? "请选择用于保存微信新文件的文件夹。" : "请选择原来的保存文件夹，恢复访问权限；不会搬动文件。", requireMatch: existing != nil && !canChoose)
-            guard url.startAccessingSecurityScopedResource() else { throw SyncError.message("未获得目录授权") }
-            let lease = DirectoryLease(url: url) { url.stopAccessingSecurityScopedResource() }
-            let bookmark = try newBookmark(url)
-            perform { session in defer { withExtendedLifetime(lease) {} }; try session.change { try AccountManager(repository: $0.accounts).configureRoot(url, bookmark: bookmark) } }
-        } catch { _ = alert("目录未变更", String(describing: error)) }
+            let panel = directoryPanel(try suggested(), title: title, message: message)
+            panel.beginSheetModal(for: window) { [weak self] response in
+                guard let self, !self.terminating else { return }
+                onDismiss?()
+                guard response == .OK, let url = panel.url else { return }
+                do { try onSelection(url) }
+                catch { reportError(String(describing: error)) }
+            }
+        } catch {
+            onDismiss?()
+            reportError(String(describing: error))
+        }
+    }
+
+    private func selectedDirectory(_ url: URL) throws -> DirectoryLease {
+        guard url.startAccessingSecurityScopedResource() else { throw SyncError.message("未获得文件夹访问许可") }
+        return DirectoryLease(url: url) { url.stopAccessingSecurityScopedResource() }
+    }
+
+    private func selectedWeChatDirectory(_ url: URL) throws -> DirectoryLease {
+        guard url.lastPathComponent == "xwechat_files" else { throw SyncError.message("请选择 xwechat_files 文件夹。") }
+        return try selectedDirectory(url)
+    }
+
+    private func showSetupError(_ message: String) {
+        setupError = message
+        render(nil, error: nil)
+    }
+
+    @objc private func authorizeRoot(_ sender: Any?) {
+        guard let existing = snapshot?.root else { return }
+        let canChoose = snapshot?.canChooseRoot == true
+        let showError: (String) -> Void = { [weak self] message in
+            self?.rootSelectionError = message
+            self?.render(nil, error: nil)
+        }
+        showDirectorySheet(suggested: existing.url, title: "文件保存位置",
+                           message: canChoose ? "请选择用于保存微信新文件的文件夹。" : "请选择原来的保存文件夹，恢复访问权限。",
+                           onError: showError) { [weak self] url in
+            guard let self else { return }
+            let lease = try self.selectedDirectory(url)
+            let bookmark = try self.makeBookmark(url)
+            self.rootSelectionError = nil
+            self.perform({ session in
+                defer { withExtendedLifetime(lease) {} }
+                try session.change { try AccountManager(repository: $0.accounts).configureRoot(url, bookmark: bookmark) }
+            }, onError: showError)
+        }
     }
 
     @objc private func openAccountFolder(_ sender: Any?) {
@@ -488,39 +851,139 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         } catch { _ = alert("无法打开账号文件夹", String(describing: error)) }
     }
 
-    @objc private func addAccount(_ sender: Any?) {
-        do {
-            // Reuse only a live parent grant. Legacy exact-source bookmarks require choosing the parent once.
-            var grant: DirectoryLease?
-            for account in snapshot?.accounts ?? [] where !account.removed {
-                if let bookmark = account.sourceBookmark, let existing = try? bookmarkScope(bookmark),
-                   existing.url.lastPathComponent == "xwechat_files" { grant = existing; break }
-            }
-            let parent = try grant ?? selectWeChatRoot()
-            perform({ _ in try WeChatDirectories.discover(in: parent.url) }, then: { [weak self] candidates in
-                guard let self else { return }
-                do {
-                    let choice = try chooseDiscoveredAccount(candidates, registered: self.snapshot?.accounts ?? [])
-                    try self.finishAdding(choice, parent: parent)
-                } catch { _ = self.alert("未添加账号", String(describing: error)) }
-            })
-        } catch { _ = alert("未添加账号", String(describing: error)) }
+    @objc private func allowWeChatAccess(_ sender: Any?) {
+        requestWeChatAccess(suggested: try expectedWeChatRoot())
     }
 
-    private func finishAdding(_ choice: DiscoveredAccount, parent: DirectoryLease) throws {
-        let selectedRoot: DirectoryLease?
-        if snapshot?.root == nil {
-            let url = try chooseDirectory(defaultManagedRoot(), title: "选择文件保存位置",
-                message: "为 \(choice.name) 选择保存位置。以后添加的账号也会分别保存在这里。", requireMatch: false)
-            guard url.startAccessingSecurityScopedResource() else { throw SyncError.message("未获得文件夹访问许可") }
-            selectedRoot = DirectoryLease(url: url) { url.stopAccessingSecurityScopedResource() }
-        } else { selectedRoot = nil }
-        guard let destination = selectedRoot?.url ?? snapshot?.root?.url else { throw SyncError.message("请重新选择文件保存位置") }
-        guard alert("添加 \(choice.name)？", "文件保存位置：\n\(destination.path)\n\n将创建独立账号文件夹，同名位置会自动避让。已有微信文件留在原处。", confirm: "开始同步") else { return }
-        let sourceBookmark = try newBookmark(parent.url)
-        let destinationBookmark = try selectedRoot.map { try newBookmark($0.url) }
+    private func requestWeChatAccess(suggested: @autoclosure () throws -> URL) {
+        guard !busy, !terminating, !stateUnavailable, window.attachedSheet == nil else { return }
+        if addPopover.isShown {
+            returningFromAddAuthorization = true
+            addPopover.close()
+        }
+        showDirectorySheet(suggested: try suggested(), title: "允许访问微信文件夹",
+                           message: "请选择 xwechat_files 文件夹。",
+                           onDismiss: { [weak self] in self?.returnToAddPopover() }) { [weak self] url in
+            guard let self else { return }
+            guard self.snapshot?.accounts.isEmpty == true || self.addingAccount else { return }
+            self.discoverAccounts(using: try self.selectedWeChatDirectory(url))
+        }
+    }
+
+    @objc private func addAccount(_ sender: Any?) {
+        guard !busy, !terminating, !stateUnavailable else { return }
+        if addPopover.isShown { addPopover.close(); return }
+        addingAccount = true
+        discoverAccounts(using: nil)
+        showAddPopover()
+    }
+
+    private func showAddPopover() {
+        addPopover.show(relativeTo: addAccountButton.bounds, of: addAccountButton, preferredEdge: .maxY)
+        // The settings window can still have keyboard focus after a sheet is dismissed.
+        if addEscapeMonitor == nil {
+            addEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, self.addPopover.isShown, event.keyCode == 53 else { return event }
+                let popoverWindow = self.addPopover.contentViewController?.view.window
+                guard event.window === self.window || event.window === popoverWindow else { return event }
+                self.addPopover.close()
+                return nil
+            }
+        }
+    }
+
+    private func returnToAddPopover() {
+        guard returningFromAddAuthorization else { return }
+        returningFromAddAuthorization = false
+        if window.isVisible && !accountPage.isHidden { showAddPopover() }
+        else { cancelAccountSetup(nil) }
+    }
+
+    func popoverWillClose(_ notification: Notification) {
+        if let addEscapeMonitor { NSEvent.removeMonitor(addEscapeMonitor); self.addEscapeMonitor = nil }
+        if !returningFromAddAuthorization { cancelAccountSetup(nil) }
+    }
+
+    private func discoverAccounts(using explicitGrant: DirectoryLease?) {
+        setupError = nil
+        let resolveBookmark = self.resolveBookmark
+        let fromPopover = addingAccount
+        perform({ session -> (DirectoryLease?, [DiscoveredAccount]) in
+            if let explicitGrant {
+                return (explicitGrant, try WeChatDirectories.discover(in: explicitGrant.url))
+            }
+            // The stored bookmark is only usable once the directory is actually readable.
+            for account in try session.store.accounts.accounts() where !account.removed {
+                if let bookmark = account.sourceBookmark, let grant = try? resolveBookmark(bookmark),
+                   grant.url.lastPathComponent == "xwechat_files",
+                   let candidates = try? WeChatDirectories.discover(in: grant.url) {
+                    return (grant, candidates)
+                }
+            }
+            return (nil, [])
+        }, then: { [weak self] grant, candidates in
+            guard let self, !fromPopover || self.addingAccount else { return }
+            self.parentGrant = grant
+            self.discoveredAccounts = candidates
+            self.render(nil, error: nil)
+        }, onError: { [weak self] error in
+            guard let self, !fromPopover || self.addingAccount else { return }
+            self.showSetupError(error)
+        })
+    }
+
+    @objc private func chooseCandidate(_ sender: NSButton) {
+        guard !busy, !terminating, !stateUnavailable,
+              let index = candidateButtons.firstIndex(where: { $0 === sender }) else { return }
+        let choice = visibleCandidates[index]
+        if snapshot?.accounts.isEmpty == true {
+            draftAccount = choice
+            setupError = nil
+            render(nil, error: nil)
+        } else {
+            finishAdding(choice)
+        }
+    }
+
+    @objc private func chooseSetupRoot(_ sender: Any?) {
+        guard draftAccount != nil else { return }
+        showDirectorySheet(suggested: try draftRoot?.url ?? snapshot?.root?.url ?? defaultManagedRoot(),
+                           title: "文件保存位置", message: "请选择用于保存微信新文件的文件夹。") { [weak self] url in
+            guard let self else { return }
+            self.setDraftRoot(try self.selectedDirectory(url))
+        }
+    }
+
+    private func setDraftRoot(_ lease: DirectoryLease) {
+        draftRoot = lease
+        setupError = nil
+        render(nil, error: nil)
+    }
+
+    @objc private func startFirstSync(_ sender: Any?) {
+        guard let draftAccount, draftRoot != nil || snapshot?.root != nil else { return }
+        finishAdding(draftAccount)
+    }
+
+    @objc private func cancelAccountSetup(_ sender: Any?) {
+        addingAccount = false
+        parentGrant = nil
+        discoveredAccounts = []
+        draftAccount = nil
+        draftRoot = nil
+        setupError = nil
+        render(nil, error: nil)
+    }
+
+    private func finishAdding(_ choice: DiscoveredAccount) {
+        guard let parent = parentGrant else { return }
+        setupError = nil
+        let selectedRoot = draftRoot
+        let makeBookmark = self.makeBookmark
         perform({ session -> String in
             defer { withExtendedLifetime((parent, selectedRoot)) {} }
+            let sourceBookmark = try makeBookmark(parent.url)
+            let destinationBookmark = try selectedRoot.map { try makeBookmark($0.url) }
             var addedID = ""
             try session.change { store in
                 let source = try WeChatDirectories.authorizedSource(grant: parent.url, expected: choice.source, identity: choice.identity)
@@ -529,7 +992,8 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
                     _ = try initialState(source: source, managedRoot: canonicalDirectory(selectedRoot.url))
                     try manager.configureRoot(selectedRoot.url, bookmark: destinationBookmark)
                 }
-                let root = try rootLease(store.accounts); defer { withExtendedLifetime(root) {} }
+                let root = try session.savedRootAccess()
+                defer { withExtendedLifetime(root) {} }
                 addedID = try manager.add(source: source, name: choice.name, bookmark: sourceBookmark).id
             }
             return addedID
@@ -538,8 +1002,9 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
             if let index = self.accountPicker.itemArray.firstIndex(where: { $0.representedObject as? String == id }) {
                 self.accountPicker.selectItem(at: index)
             }
-            self.selectedID = id; self.render(nil, error: nil)
-        })
+            if self.addPopover.isShown { self.addPopover.close() }
+            else { self.cancelAccountSetup(nil) }
+        }, onError: { [weak self] in self?.showSetupError($0) })
     }
 
     @objc private func pauseAccount(_ sender: Any?) {
@@ -550,25 +1015,39 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
 
     @objc private func authorizeAccount(_ sender: Any?) {
         guard let account else { return }
-        do {
-            let parent = account.sourceURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            let source = try selectWeChatRoot(suggested: parent), bookmark = try newBookmark(source.url)
-            if account.removed && !alert("恢复管理此账号？", "将沿用原记录与文件夹，不重新建立历史基线。", confirm: "恢复管理") { return }
-            perform { session in
+        let parent = account.sourceURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        showDirectorySheet(suggested: parent, title: "重新授权微信文件夹",
+                           message: "请选择原来的 xwechat_files 文件夹。") { [weak self] url in
+            guard let self else { return }
+            let source = try self.selectedWeChatDirectory(url)
+            let bookmark = try self.makeBookmark(url)
+            if account.removed && !self.alert("恢复管理此账号？", "将沿用原记录与文件夹，不重新建立历史基线。", confirm: "恢复管理") { return }
+            self.setupError = nil
+            self.perform({ session in
                 defer { withExtendedLifetime(source) {} }
                 try session.change { store in
-                    let root = try rootLease(store.accounts); defer { withExtendedLifetime(root) {} }
+                    let root = try session.savedRootAccess()
+                    defer { withExtendedLifetime(root) {} }
                     let sourceURL = try WeChatDirectories.authorizedSource(grant: source.url, expected: account.sourceURL, identity: account.sourceIdentity)
                     try AccountManager(repository: store.accounts).reauthorize(account.id, source: sourceURL, bookmark: bookmark, restoring: account.removed)
                 }
-            }
-        } catch { _ = alert("未更新授权", String(describing: error)) }
+            }, onError: { [weak self] in self?.showSetupError($0) })
+        }
     }
 
     @objc private func removeAccount(_ sender: Any?) {
-        guard let account, !account.removed,
-              alert("停止管理“\(WeChatDirectories.displayName(source: account.sourceURL))”？", "保留已保存的文件。此后不再同步新文件，也不再更新微信中的文件位置。", confirm: "停止管理") else { return }
-        perform { session in try session.change { try $0.accounts.remove(account.id) } }
+        guard !busy, !terminating, !stateUnavailable, window.attachedSheet == nil, let account, !account.removed else { return }
+        let confirmation = NSAlert()
+        confirmation.messageText = "停止管理“\(WeChatDirectories.displayName(source: account.sourceURL))”？"
+        confirmation.informativeText = "停止同步和更新链接，保留已同步的文件。"
+        let stop = confirmation.addButton(withTitle: "停止管理")
+        stop.hasDestructiveAction = true
+        stop.keyEquivalent = ""
+        confirmation.addButton(withTitle: "取消").keyEquivalent = "\u{1B}"
+        confirmation.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.perform { session in try session.change { try $0.accounts.remove(account.id) } }
+        }
     }
 
     @objc private func toggleReadOnly(_ sender: Any?) {
@@ -642,7 +1121,8 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
         case .enabled: loginStatus.stringValue = "下次登录时自动启动"
         case .requiresApproval: loginStatus.stringValue = "还需在系统设置的“登录项”中允许"
         case .notRegistered: loginStatus.stringValue = "未启用"
-        default: loginStatus.stringValue = "服务不可用，请确认应用位于 Applications"
+        case .notFound: loginStatus.stringValue = "系统未找到登录项"
+        @unknown default: loginStatus.stringValue = "无法读取登录项状态"
         }
         #endif
     }
@@ -700,8 +1180,12 @@ func desktopPreviewTest(output: URL, manual: Bool = false, autoClose: Bool = fal
     guard controller.account?.id == account.id, controller.readOnly.state == .on,
           !controller.applicationShouldTerminateAfterLastWindowClosed(NSApp) else { throw SyncError.message("设置窗口状态或生命周期不符") }
     let content = controller.window.contentView!
-    guard abs(content.bounds.width - 960) < 1, abs(content.bounds.height - 720) < 1 else { throw SyncError.message("首次显示没有保持默认窗口尺寸") }
+    let expected = DesktopController.defaultSettingsSize
+    guard abs(content.bounds.width - expected.width) < 1, abs(content.bounds.height - expected.height) < 1 else {
+        throw SyncError.message("首次显示没有保持默认窗口尺寸")
+    }
     try controller.reviewAccountSelection()
+    controller.reviewMenuStatus()
     try controller.reviewSettingsLayout()
     try content.dataWithPDF(inside: content.bounds).write(to: output.deletingPathExtension().appendingPathExtension("pdf"))
     try controller.writeGeneralPreview(output.deletingPathExtension().appendingPathExtension("general.pdf"))
@@ -724,14 +1208,214 @@ func desktopPreviewTest(output: URL, manual: Bool = false, autoClose: Bool = fal
     }
     controller.window.performClose(nil)
     guard !controller.window.isVisible else { throw SyncError.message("设置窗口未关闭") }
-    controller.showSettings(nil)
-    guard controller.window.isVisible else { throw SyncError.message("设置窗口无法重新打开") }
+    try controller.reviewSettingsShortcut()
     controller.reviewReadFailureState(try session.snapshot())
     controller.window.close()
+    try DesktopController.reviewInlineSetup(temporary: temporary)
     try desktopWorkerReviewTest(temporary: temporary)
     print("临时样本设置界面、自定义目录、账号状态和关闭／重开检查通过")
 }
 fileprivate extension DesktopController {
+    func reviewSettingsShortcut() throws {
+        guard let item = statusItem.menu?.item(withTitle: "设置"), item.keyEquivalent == ",",
+              item.keyEquivalentModifierMask == .command,
+              let shortcut = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil,
+                characters: ",", charactersIgnoringModifiers: ",", isARepeat: false, keyCode: 43),
+              NSApp.mainMenu?.performKeyEquivalent(with: shortcut) == true, window.isVisible else {
+            throw SyncError.message("设置菜单没有显示快捷键，或无法用 Command–逗号重新打开设置")
+        }
+    }
+
+    static func reviewInlineSetup(temporary: URL) throws {
+        let base = temporary.appendingPathComponent("inline-setup")
+        let parent = base.appendingPathComponent("xwechat_files")
+        let root = base.appendingPathComponent("保存目录")
+        let first = parent.appendingPathComponent("first_account/msg/file")
+        let second = parent.appendingPathComponent("second_account/msg/file")
+        let expired = base.appendingPathComponent("fake-expired")
+        let expiredParent = base.appendingPathComponent("fake-parent-expired")
+        let database = base.appendingPathComponent("state.sqlite")
+        for url in [root, first, second] { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) }
+        let history = first.appendingPathComponent("history.txt")
+        try Data("existing".utf8).write(to: history)
+        let worker = DesktopWorker(makeSession: {
+            try ApplicationSession(database: database, rootAuthorization: { DirectoryLease(url: $0.url) },
+                sourceAuthorization: { account in
+                    if account.source == first.path && FileManager.default.fileExists(atPath: expired.path) {
+                        throw SyncError.message("临时授权已失效")
+                    }
+                    return DirectoryLease(url: account.sourceURL)
+                })
+        }, scanInterval: 0.2)
+        let fakeBookmark = Data("test-parent-grant".utf8)
+        let controller = DesktopController(worker: worker, makeBookmark: { url in
+            guard url == parent || url == root else { throw SyncError.message("测试书签只能用于临时样本") }
+            return fakeBookmark
+        }, resolveBookmark: { data in
+            guard data == fakeBookmark, !FileManager.default.fileExists(atPath: expiredParent.path) else {
+                throw SyncError.message("临时父目录授权不可用")
+            }
+            return DirectoryLease(url: parent)
+        })
+        defer { controller.window?.close(); worker.stop {} }
+        func wait(_ message: String, _ condition: () -> Bool) throws {
+            let deadline = Date().addingTimeInterval(5)
+            while !condition() && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+            guard condition() else { throw SyncError.message(message + (controller.setupError.map { "：\($0)" } ?? "")) }
+        }
+        func cancelSheet() throws {
+            try wait("点击后未打开目录选择窗口") { controller.window.attachedSheet is NSOpenPanel }
+            let panel = controller.window.attachedSheet as! NSOpenPanel
+            panel.cancel(nil)
+            try wait("目录选择窗口没有关闭") { controller.window.attachedSheet == nil }
+            precondition(controller.setupError == nil && NSApp.modalWindow == nil, "取消不应弹出提示")
+        }
+
+        controller.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+        try wait("空配置启动未打开设置") { controller.window.isVisible && controller.allowWeChat.isEnabled }
+        precondition(controller.window.attachedSheet == nil && !controller.setupGroup.isHidden)
+        precondition(!controller.allowWeChat.isHidden && controller.draftDestination.isHidden)
+        controller.requestWeChatAccess(suggested: parent)
+        try cancelSheet()
+        precondition(controller.parentGrant == nil && !controller.allowWeChat.isHidden)
+
+        controller.discoverAccounts(using: DirectoryLease(url: root))
+        try wait("选错文件夹后未显示页内提示") { !controller.setupFeedback.isHidden && !controller.busy }
+        precondition(controller.parentGrant == nil && !controller.allowWeChat.isHidden && NSApp.modalWindow == nil)
+
+        controller.discoverAccounts(using: DirectoryLease(url: parent))
+        try wait("没有在设置页列出两个账号") { controller.candidateButtons.count == 2 && !controller.busy }
+        precondition(controller.allowWeChat.isHidden && controller.snapshot?.accounts.isEmpty == true)
+        let firstButton = controller.candidateButtons[0]
+        firstButton.performClick(nil)
+        precondition(controller.draftAccount?.source.path == first.path && !controller.draftDestination.isHidden && !controller.startSync.isEnabled,
+                     "选择账号后应显示保存位置，但还不能开始同步")
+        controller.setDraftRoot(DirectoryLease(url: root))
+        controller.chooseDraftDestination.performClick(nil)
+        try cancelSheet()
+        precondition(controller.draftRoot?.url == root && controller.startSync.isEnabled && controller.snapshot?.root == nil)
+        controller.window.setContentSize(minimumSettingsSize)
+        controller.window.contentView!.layoutSubtreeIfNeeded()
+        let visible = controller.pageScroll.contentView.bounds
+        let startFrame = controller.startSync.convert(controller.startSync.bounds, to: controller.pageScroll.contentView)
+        precondition(visible.contains(startFrame), "两个候选账号时应能在最小窗口中看到开始同步按钮")
+        controller.window.performClose(nil)
+        controller.showSettings(nil)
+        precondition(controller.draftAccount?.source.path == first.path && controller.draftRoot?.url.path == root.path)
+        controller.startSync.performClick(nil)
+        try wait("开始同步未保存首个账号") { controller.snapshot?.accounts.count == 1 && !controller.busy }
+        precondition(controller.snapshot?.root?.url.path == root.path && controller.setupGroup.isHidden)
+        let historyInfo = try readFileInfo(history.path)
+        precondition(historyInfo?.regular == true)
+        try wait("首个账号状态没有显示在微信账号栏") { controller.status.stringValue == "等待新文件" }
+        controller.window.contentView!.layoutSubtreeIfNeeded()
+        let settingsHeight = controller.pageScroll.documentView!.frame.height
+        let viewportHeight = controller.pageScroll.contentView.bounds.height
+
+        try Data().write(to: expiredParent)
+        controller.addAccountButton.performClick(nil)
+        try wait("旧授权不可用时未显示浮层授权入口") {
+            controller.addPopover.isShown && !controller.allowAddAccess.isHidden && !controller.busy
+        }
+        precondition(controller.candidateButtons.isEmpty && controller.window.attachedSheet == nil)
+        controller.requestWeChatAccess(suggested: parent)
+        try cancelSheet()
+        try wait("取消授权后没有回到浮层") { controller.addPopover.isShown }
+        precondition(controller.snapshot?.accounts.count == 1 && !controller.allowAddAccess.isHidden)
+        guard let popoverWindow = controller.addPopover.contentViewController?.view.window,
+              let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: popoverWindow.windowNumber,
+                context: nil, characters: "\u{1B}", charactersIgnoringModifiers: "\u{1B}", isARepeat: false, keyCode: 53) else {
+            throw SyncError.message("无法检查浮层 Esc 操作")
+        }
+        NSApp.sendEvent(escape)
+        try wait("按 Esc 后浮层没有关闭") {
+            !controller.addPopover.isShown && !controller.addingAccount
+        }
+        try FileManager.default.removeItem(at: expiredParent)
+
+        for index in 0..<10 {
+            let source = parent.appendingPathComponent("test_extra_\(index)/msg/file")
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        }
+        controller.addAccountButton.performClick(nil)
+        try wait("添加时未复用已有授权") { controller.addPopover.isShown && controller.candidateButtons.count == 11 && !controller.busy }
+        precondition(controller.window.attachedSheet == nil && controller.allowAddAccess.isHidden)
+        controller.addPopover.contentViewController!.view.layoutSubtreeIfNeeded()
+        controller.window.contentView!.layoutSubtreeIfNeeded()
+        precondition(controller.addScroll.documentView!.frame.height > controller.addScroll.contentView.bounds.height,
+                     "长列表应在浮层内滚动")
+        precondition(abs(controller.pageScroll.documentView!.frame.height - settingsHeight) < 1 &&
+                     settingsHeight <= viewportHeight + 1 && !controller.addAccountButton.isHidden,
+                     "打开浮层后设置页不应长高或出现滚动条")
+        precondition(controller.visibleCandidates.first?.source.path == second.path && controller.candidateButtons[0].title == "添加")
+        controller.chooseCandidate(firstButton)
+        precondition(!controller.busy && controller.snapshot?.accounts.count == 1, "旧候选按钮不能误添加当前列表中的其他账号")
+        controller.candidateButtons[0].performClick(nil)
+        try wait("浮层添加未保存第二个账号或没有关闭") {
+            controller.snapshot?.accounts.count == 2 && !controller.busy && !controller.addPopover.isShown
+        }
+        precondition(controller.account?.source == second.path && controller.snapshot?.root?.url.path == root.path)
+        precondition(controller.setupGroup.isHidden && controller.reauthorizeWeChat.isHidden)
+        try wait("添加第二个账号后未恢复等待新文件") { controller.status.stringValue == "等待新文件" }
+
+        try Data().write(to: expired)
+        try wait("授权失效没有反映在状态中") { controller.snapshot?.unavailableSources.count == 1 }
+        precondition(controller.reauthorizeWeChat.isHidden, "另一个账号的授权错误不应影响当前账号")
+        precondition(controller.status.stringValue == "1 个账号需要处理" && controller.setupFeedback.isHidden)
+        let firstID = controller.snapshot!.accounts.first { $0.source == first.path }!.id
+        let firstItem = controller.accountPicker.itemArray.first { $0.representedObject as? String == firstID }!
+        precondition(firstItem.title.hasSuffix("（需要处理）") && !controller.menuProblem.isHidden)
+        controller.showPage(1)
+        precondition(NSApp.sendAction(controller.menuProblem.action!, to: controller.menuProblem.target, from: controller.menuProblem))
+        precondition(controller.account?.id == firstID && !controller.accountPage.isHidden)
+        precondition(!controller.reauthorizeWeChat.isHidden)
+        precondition(!controller.setupFeedback.isHidden && controller.setupFeedback.stringValue == "无法访问此账号的微信文件夹。")
+        precondition(controller.setupFeedback.toolTip == "临时授权已失效")
+        controller.reauthorizeWeChat.performClick(nil)
+        try cancelSheet()
+        precondition(!controller.reauthorizeWeChat.isHidden && controller.account?.id == firstID)
+        try FileManager.default.removeItem(at: expired)
+        try wait("访问恢复后仍显示重新授权") { controller.reauthorizeWeChat.isHidden }
+        precondition(controller.menuProblem.isHidden && !firstItem.title.hasSuffix("（需要处理）"))
+
+        let savedFile = root.appendingPathComponent(controller.account!.archiveRelative).appendingPathComponent("saved.txt")
+        try Data("keep".utf8).write(to: savedFile)
+        func stopConfirmationButton(_ title: String) throws -> NSButton {
+            try wait("停止管理没有打开确认窗口") { controller.window.attachedSheet != nil }
+            let sheet = controller.window.attachedSheet!
+            sheet.contentView?.layoutSubtreeIfNeeded()
+            func visibleViews(_ view: NSView) -> [NSView] {
+                guard !view.isHidden else { return [] }
+                return [view] + view.subviews.flatMap(visibleViews)
+            }
+            let views = sheet.contentView.map(visibleViews) ?? []
+            let visibleIcons = views.compactMap { $0 as? NSImageView }.filter {
+                $0.image != nil && $0.alphaValue > 0 && $0.frame.width >= 24
+            }
+            print("停止管理确认的可见大图标数量：\(visibleIcons.count)")
+            guard let button = views.compactMap({ $0 as? NSButton }).first(where: { $0.title == title }) else {
+                throw SyncError.message("停止管理确认缺少按钮：\(title)")
+            }
+            return button
+        }
+        controller.removeAccount(nil)
+        try stopConfirmationButton("取消").performClick(nil)
+        try wait("取消停止管理后确认窗口没有关闭") { controller.window.attachedSheet == nil }
+        precondition(controller.account?.id == firstID && controller.account?.removed == false)
+        controller.removeAccount(nil)
+        try stopConfirmationButton("停止管理").performClick(nil)
+        try wait("确认停止管理后账号状态没有更新") { controller.account?.removed == true && !controller.busy }
+        let savedContent = try String(contentsOf: savedFile, encoding: .utf8)
+        precondition(savedContent == "keep" && controller.snapshot?.accounts.filter { !$0.removed }.count == 1)
+
+        var stopped = false
+        worker.stop { stopped = true }
+        try wait("临时会话没有结束") { stopped }
+        print("临时设置：首次启动、授权取消、浮层添加、内部滚动及账号状态均通过")
+    }
+
     func reviewAccountSelection() throws {
         let good = snapshot!, first = good.accounts[0]
         let second = Account(id: "preview-second", rootID: first.rootID, name: "second_preview",
@@ -747,6 +1431,32 @@ fileprivate extension DesktopController {
         render(two, error: nil)
         precondition(account?.id == second.id)
         render(good, error: nil)
+    }
+
+    func reviewMenuStatus() {
+        let good = snapshot!
+        let menu = statusItem.menu!
+        precondition(menu.items.first === menuStatus && !menuStatus.isEnabled)
+        let unconfigured = ApplicationSnapshot(root: nil, canChooseRoot: true, accounts: [], readOnly: [:], recoverable: [:], message: "请添加微信账号")
+        render(unconfigured, error: nil)
+        precondition(menuStatus.title == "等待设置" && !accountStatus.isHidden && menuProblem.isHidden && !menuOpenRoot.isEnabled)
+        var sample = good
+        for (state, title) in [(ApplicationSyncStatus.waiting, "等待检查"), (.idle, "等待新文件"),
+                               (.processing, "正在处理新文件"), (.paused, "新文件同步已暂停"), (.retrying, "正在重试")] {
+            sample.syncStatus = state
+            render(sample, error: nil)
+            precondition(menuStatus.title == title && status.stringValue == title && menuProblem.isHidden)
+        }
+        render(nil, error: ApplicationSession.databaseBusyMessage)
+        precondition(menuStatus.title == "正在重试" && menuProblem.isHidden && !menuOpenRoot.isEnabled)
+        sample.syncStatus = .savingLocationUnavailable
+        render(sample, error: "保存位置授权失效")
+        precondition(menuStatus.title == "无法访问保存位置" && !menuProblem.isHidden && !menuOpenRoot.isEnabled)
+        precondition(NSApp.sendAction(menuProblem.action!, to: menuProblem.target, from: menuProblem))
+        precondition(!generalPage.isHidden && !rootFeedback.isHidden)
+        render(good, error: nil)
+        precondition(menuProblem.isHidden && rootFeedback.isHidden && menuOpenRoot.isEnabled)
+        showPage(0)
     }
 
     @available(macOS 14.4, *)
@@ -801,18 +1511,19 @@ fileprivate extension DesktopController {
         // Both appearances and page sizes use the same geometry and semantic controls.
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
             window.appearance = NSAppearance(named: appearance)
-            for size in [NSSize(width: 960, height: 720), NSSize(width: 880, height: 680)] {
+            for size in [Self.defaultSettingsSize, Self.minimumSettingsSize] {
                 window.setContentSize(size)
                 for index in [0, 1] {
                     showPage(index); window.contentView!.layoutSubtreeIfNeeded()
                     let page = index == 0 ? accountPage! : generalPage!
                     guard page.frame.minY >= 0, page.frame.maxY <= page.superview!.bounds.height + 1,
-                          page.arrangedSubviews.allSatisfy({ $0.frame.minY >= -1 && $0.frame.maxY <= page.bounds.height + 1 }) else {
+                          page.arrangedSubviews.filter({ !$0.isHidden }).allSatisfy({ $0.frame.minY >= -1 && $0.frame.maxY <= page.bounds.height + 1 }) else {
                         throw SyncError.message("设置页面超出窗口范围：\(index)")
                     }
                     func check(_ view: NSView) throws {
+                        if view.isHidden { return }
                         if let stack = view as? NSStackView, stack.orientation == .horizontal {
-                            for child in stack.arrangedSubviews {
+                            for child in stack.arrangedSubviews where !child.isHidden {
                                 guard child.frame.minX >= -2, child.frame.maxX <= stack.bounds.width + 2 else {
                                     throw SyncError.message("设置行超出窗口范围")
                                 }
@@ -833,7 +1544,8 @@ fileprivate extension DesktopController {
                         throw SyncError.message("设置内容没有填满右侧区域")
                     }
                     let visible = page.convert(page.bounds, to: pageScroll.contentView)
-                    guard abs(visible.minY - 28) <= 2, visible.maxY <= pageScroll.contentView.bounds.height + 1 else {
+                    guard abs(visible.minY - 28) <= 2, visible.maxY <= pageScroll.contentView.bounds.height + 1,
+                          pageScroll.documentView!.bounds.height <= pageScroll.contentView.bounds.height + 1 else {
                         throw SyncError.message("设置初始内容未完整显示或未从顶部开始")
                     }
                     precondition(navigation[index].state == .on && navigation[1 - index].state == .off)
@@ -842,7 +1554,7 @@ fileprivate extension DesktopController {
             }
         }
         window.appearance = nil
-        window.setContentSize(NSSize(width: 960, height: 720)); showPage(0)
+        window.setContentSize(Self.defaultSettingsSize); showPage(0)
         window.contentView!.layoutSubtreeIfNeeded()
         precondition(accountPicker.titleOfSelectedItem == "sample_account_2070")
         precondition(syncSwitch.state == .on && syncSwitch.isEnabled)
@@ -857,7 +1569,7 @@ fileprivate extension DesktopController {
         precondition(more.menu?.items.first { $0.action == #selector(removeAccount(_:)) }?.isEnabled == false)
         render(good, error: nil)
         render(ApplicationSnapshot(root: nil, canChooseRoot: true, accounts: [], readOnly: [:], recoverable: [:], message: "先添加微信账号"), error: nil)
-        precondition(actionButtons.first { $0.action == #selector(addAccount(_:)) }?.isEnabled == true)
+        precondition(!allowWeChat.isHidden && allowWeChat.isEnabled && managedAccountGroup.isHidden)
         precondition(!syncSwitch.isEnabled && !readOnly.isEnabled && !more.isEnabled)
         render(good, error: nil)
     }
@@ -883,12 +1595,13 @@ fileprivate extension DesktopController {
 
     func reviewReadFailureState(_ good: ApplicationSnapshot) {
         render(nil, error: "状态读取失败：临时注入")
-        precondition(status.stringValue.contains("状态读取失败") && !readOnly.isEnabled)
+        precondition(status.stringValue == "需要处理" && setupFeedback.stringValue.contains("状态读取失败") && !readOnly.isEnabled)
         precondition(actionButtons.allSatisfy { !$0.isEnabled })
         render(nil, error: nil)
-        precondition(status.stringValue.contains("状态读取失败"), "本地刷新不能将读库错误变回旧的正常状态")
+        precondition(status.stringValue == "需要处理" && setupFeedback.stringValue.contains("状态读取失败"),
+                     "本地刷新不能将读库错误变回旧的正常状态")
         render(good, error: nil)
-        precondition(readOnly.isEnabled && !status.stringValue.contains("状态读取失败"))
+        precondition(readOnly.isEnabled && status.stringValue != "需要处理")
     }
 }
 
@@ -902,25 +1615,37 @@ private func desktopWorkerReviewTest(temporary: URL) throws {
         let manager = AccountManager(repository: session.store.accounts)
         try manager.configureRoot(root, bookmark: nil)
         _ = try manager.add(source: source, name: "queue-fixture", bookmark: nil)
+        _ = try session.store.accounts.scalar("PRAGMA busy_timeout = 0")
         return session
-    }, scanInterval: 60)
-    var opened = false, readFailed = false, corruptCompleted = false
+    }, scanInterval: 0.2)
+    var healthy = false, databaseBusy = false, readFailed = false, corruptCompleted = false
+    var lastMessage: String?
     worker.update = { value, error in
-        if value != nil { opened = true }
+        lastMessage = error ?? value?.message
+        healthy = value?.syncStatus == .idle && error == nil
+        if value == nil && error == ApplicationSession.databaseBusyMessage { databaseBusy = true }
         if value == nil && error?.contains("状态读取失败") == true { readFailed = true }
     }
-    func wait(_ condition: () -> Bool) throws {
+    func wait(_ step: String, _ condition: () -> Bool) throws {
         let deadline = Date().addingTimeInterval(5)
         while Date() < deadline {
             if condition() { return }
             RunLoop.current.run(until: Date().addingTimeInterval(0.01))
         }
-        throw SyncError.message("串行会话隔离测试等待超时")
+        throw SyncError.message("串行会话测试超时（\(step)）：\(lastMessage ?? "无状态")")
     }
     worker.start()
-    try wait { opened }
+    try wait("启动并完成首次扫描") { healthy }
+    let blocker = try SQLiteConnection(url: database)
+    try blocker.execute("BEGIN EXCLUSIVE TRANSACTION")
+    do {
+        defer { try? blocker.execute("ROLLBACK") }
+        try wait("运行时识别数据库占用") { databaseBusy }
+    }
+    try wait("从运行时占用恢复") { healthy }
+
     worker.perform({ session in try session.store.accounts.execute("DROP TABLE account_settings") }) { _ in corruptCompleted = true }
-    try wait { corruptCompleted }
+    try wait("处理读库故障") { corruptCompleted }
     guard readFailed else { throw SyncError.message("读库错误被隐藏为旧的正常状态") }
     let started = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
     var actionCompleted = false, stopped = false
@@ -930,15 +1655,15 @@ private func desktopWorkerReviewTest(temporary: URL) throws {
         guard release.wait(timeout: .now() + 5) == .success else { throw SyncError.message("测试释放超时") }
         return true
     }) { result in if case .success = result { actionCompleted = true } }
-    try wait { started.wait(timeout: .now()) == .success }
+    try wait("退出前的动作开始") { started.wait(timeout: .now()) == .success }
     worker.stop { stopped = true }
     precondition(!stopped)
     release.signal()
-    try wait { stopped }
+    try wait("退出完成") { stopped }
     guard actionCompleted else { throw SyncError.message("退出没有等待已排队动作") }
     let fresh = try ApplicationSession(database: database, rootAuthorization: { DirectoryLease(url: $0.url) }, sourceAuthorization: { DirectoryLease(url: $0.sourceURL) })
     withExtendedLifetime(fresh) {}
-    print("临时串行会话：读库错误明确报告、退出等待动作并释放写锁检查通过")
+    print("临时串行会话：运行时数据库占用可恢复，读库故障及退出写锁检查通过")
 }
 
 #endif

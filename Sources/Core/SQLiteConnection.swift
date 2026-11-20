@@ -4,6 +4,16 @@ import Darwin
 
 struct SQLiteStoreError: Error, CustomStringConvertible {
     let description: String
+    var code: Int32? = nil
+}
+
+func isDatabaseBusy(_ error: Error) -> Bool {
+    let code: Int32?
+    if let error = error as? SQLiteStoreError { code = error.code }
+    else if let error = error as? SyncError, case .persistence(_, let sqliteCode) = error { code = sqliteCode }
+    else { return false }
+    // Extended result codes store the primary result in the low byte.
+    return code.map { ($0 & 0xFF) == SQLITE_BUSY } ?? false
 }
 
 enum SQLValue {
@@ -20,11 +30,12 @@ class SQLiteConnection {
         self.readOnly = readOnly
         let existed = FileManager.default.fileExists(atPath: url.path)
         let flags = readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
-        guard sqlite3_open_v2(url.path, &database, flags, nil) == SQLITE_OK else {
+        let opened = sqlite3_open_v2(url.path, &database, flags, nil)
+        guard opened == SQLITE_OK else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "无法打开数据库"
             if let database { sqlite3_close(database) }
             database = nil
-            throw SQLiteStoreError(description: message)
+            throw SQLiteStoreError(description: message, code: opened)
         }
         do {
             sqlite3_busy_timeout(database, 5000)
@@ -62,7 +73,8 @@ class SQLiteConnection {
     }
 
     func failure(_ operation: String) -> SQLiteStoreError {
-        SQLiteStoreError(description: "\(operation)：\(String(cString: sqlite3_errmsg(database)))")
+        SQLiteStoreError(description: "\(operation)：\(String(cString: sqlite3_errmsg(database)))",
+                         code: sqlite3_extended_errcode(database))
     }
 
     func prepare(_ sql: String, _ values: [SQLValue] = []) throws -> OpaquePointer {
@@ -87,8 +99,9 @@ class SQLiteConnection {
                     : data.withUnsafeBytes { sqlite3_bind_blob(statement, index, $0.baseAddress, Int32(data.count), transient) }
             }
             guard result == SQLITE_OK else {
+                let error = failure("绑定数据库参数")
                 sqlite3_finalize(statement)
-                throw failure("绑定数据库参数")
+                throw error
             }
         }
         return statement
@@ -134,7 +147,14 @@ class SQLiteConnection {
             try body()
             try execute("COMMIT")
         } catch {
-            try? execute("ROLLBACK")
+            // Retry only when the failed transaction has ended. A rollback failure
+            // must not be mistaken for another temporary lock.
+            if sqlite3_get_autocommit(database) == 0 {
+                do { try execute("ROLLBACK") }
+                catch let rollbackError {
+                    throw SQLiteStoreError(description: "数据库回滚失败：\(rollbackError)（原错误：\(error)）")
+                }
+            }
             throw error
         }
     }

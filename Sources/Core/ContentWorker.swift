@@ -30,7 +30,7 @@ final class ContentWorker {
         catch let error as SyncError {
             if case .persistence = error { throw error }
             try issue(relative, error.description)
-        } catch let error as SQLiteStoreError { throw SyncError.persistence(error.description) }
+        } catch let error as SQLiteStoreError { throw SyncError.persistenceFailure(error) }
         catch { try issue(relative, String(describing: error)) }
     }
 
@@ -80,7 +80,8 @@ final class ContentWorker {
             report.issues.append(ScanIssue(relative: account.archiveRelative, message: "账号归档目录不可用，新文件同步暂停"))
             return
         }
-        let current = try allFiles(account.sourceURL)
+        let entries = try fileEntries(account.sourceURL, includingLinks: true)
+        let current = entries.filter { $0.value.regular }
         let old = try store.accounts.loadState(accountID)
         var baseline = old
         let identities = Set(old.baseline.values)
@@ -91,19 +92,26 @@ final class ContentWorker {
         if baseline != old {
             let adapter = AccountStateStore(repository: store.accounts, accountID: accountID)
             _ = try adapter.load()
-            do { try adapter.save(baseline) } catch { throw SyncError.persistence(String(describing: error)) }
+            do { try adapter.save(baseline) } catch { throw SyncError.persistenceFailure(error) }
         }
+        try trackForwardedLinks(entries.filter { $0.value.symbolicLink && baseline.baseline[$0.key] == nil },
+                                account: account, root: root.url)
         var budget = hashBudget
         for path in current.keys.sorted() {
             guard let info = current[path], baseline.baseline[path] == nil else { continue }
             if try store.sources(accountID).contains(where: { $0.active && $0.relative == path }) { continue }
             guard let observation = observations[path], observation.info == info else {
                 hashes.removeValue(forKey: path)
-                observations[path] = Observation(info: info, firstSeen: clock()); continue
+                observations[path] = Observation(info: info, firstSeen: clock())
+                report.hasPendingIntake = true
+                continue
             }
-            guard clock().timeIntervalSince(observation.firstSeen) >= settleSeconds else { continue }
-            if budget <= 0 { continue }
-            if !hashes.isEmpty && hashes[path] == nil { continue } // At most one open observation job per account.
+            guard clock().timeIntervalSince(observation.firstSeen) >= settleSeconds,
+                  budget > 0, hashes.isEmpty || hashes[path] != nil else {
+                report.hasPendingIntake = true
+                continue
+            }
+            // The hash job is reused across scans until the file has been read completely.
             var keepHash = false
             try process(path) {
                 if hashes[path] == nil {
@@ -113,7 +121,9 @@ final class ContentWorker {
                 guard let digest = try job.advance(budget: &budget) else { keepHash = true; return }
                 try intake(path, info: info, account: account, root: root.url, archive: archive, index: index, incoming: job.file, digest: digest)
             }
-            if !keepHash {
+            if keepHash {
+                report.hasPendingIntake = true
+            } else {
                 hashes.removeValue(forKey: path)
                 observations.removeValue(forKey: path)
             }
@@ -126,6 +136,42 @@ final class ContentWorker {
             if !report.issues.contains(where: { $0.relative == issue.relative && $0.message == issue.message }) {
                 report.issues.append(issue)
             }
+        }
+    }
+
+    private func trackForwardedLinks(_ links: [String: FileInfo], account: Account, root: URL) throws {
+        guard !links.isEmpty else { return }
+        let sources = try store.sources(accountID)
+        let seenPaths = Set(sources.map(\.relative))
+        let newLinks = links.filter { !seenPaths.contains($0.key) }
+        guard !newLinks.isEmpty else { return }
+
+        // WeChat can copy an existing link when forwarding instead of writing a new regular file.
+        // Only take on new paths when a tracked link in this account proves the same live target.
+        let linkedSources = Dictionary(grouping: sources.filter { $0.active && $0.status == .linked }, by: \.entityID)
+        let entities = try store.entities(accountID).filter {
+            linkedSources[$0.id] != nil && ($0.status == .unchecked || $0.status == .ready || $0.status == .modified)
+        }
+        let entitiesByTarget = Dictionary(grouping: entities, by: { root.appendingPathComponent($0.relative).path })
+        for (relative, observed) in newLinks {
+            guard let file = try? checkedFile(account.sourceURL, relative: relative),
+                  let destination = linkTarget(file.path),
+                  let matches = entitiesByTarget[destination], matches.count == 1,
+                  let entity = matches.first,
+                  let target = try? checkedFile(root, relative: entity.relative),
+                  let info = try readFileInfo(target.path), info.regular, info.identity == entity.identity else { continue }
+            let hasTrackedLink = linkedSources[entity.id, default: []].contains { source in
+                guard source.linkRelative == entity.relative,
+                      let tracked = try? checkedFile(account.sourceURL, relative: source.relative) else { return false }
+                return linkTarget(tracked.path) == destination
+            }
+            guard hasTrackedLink, try readFileInfo(file.path) == observed,
+                  linkTarget(file.path) == destination else { continue }
+            // No independent received bytes exist at this path, so leave its receipt digest absent.
+            let source = ContentSource(id: UUID().uuidString, accountID: accountID, relative: relative,
+                entityID: entity.id, originalName: file.lastPathComponent, receivedIdentity: observed.identity,
+                receivedDigest: nil, status: .linked, active: true, linkRelative: entity.relative)
+            try store.atomic { try store.put(source) }
         }
     }
 

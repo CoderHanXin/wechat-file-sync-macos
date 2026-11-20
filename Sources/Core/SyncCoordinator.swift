@@ -12,6 +12,7 @@ struct AccountScanResult {
     let paused: Bool
     let report: ScanReport?
     let error: String?
+    var sourceUnavailable = false
 }
 
 struct CoordinatorReport {
@@ -75,7 +76,7 @@ final class SyncCoordinator {
                 bindings.removeValue(forKey: account.id)
                 result.accounts.append(AccountScanResult(accountID: account.id, paused: !account.intakeEnabled, report: nil, error: error.description))
             } catch let error as SQLiteStoreError {
-                throw SyncError.persistence(error.description)
+                throw SyncError.persistenceFailure(error)
             } catch {
                 workers.removeValue(forKey: account.id)
                 bindings.removeValue(forKey: account.id)

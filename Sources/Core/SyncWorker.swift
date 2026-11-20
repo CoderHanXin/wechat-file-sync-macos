@@ -11,6 +11,7 @@ struct ScanIssue: Equatable {
 struct ScanReport {
     var issues: [ScanIssue] = []
     var managedRootEnumerations = 0
+    var hasPendingIntake = false
 }
 
 final class SyncWorker {
@@ -51,7 +52,7 @@ final class SyncWorker {
             try store.save(state)
             lastPersisted = state
         } catch {
-            throw SyncError.persistence(String(describing: error))
+            throw SyncError.persistenceFailure(error)
         }
     }
 

@@ -26,6 +26,10 @@ func linkTarget(_ path: String) -> String? {
 }
 
 func allFiles(_ source: URL) throws -> [String: FileInfo] {
+    try fileEntries(source, includingLinks: false)
+}
+
+func fileEntries(_ source: URL, includingLinks: Bool) throws -> [String: FileInfo] {
     var walkError: Error?
     guard let resolved = realpath(source.path, nil) else {
         throw SyncError.system("解析文件目录", errno)
@@ -47,7 +51,9 @@ func allFiles(_ source: URL) throws -> [String: FileInfo] {
             if try readFileInfo(url.path)?.directory == true { enumerator.skipDescendants() }
             continue
         }
-        guard let info = try readFileInfo(url.path), info.regular else { continue }
+        guard let info = try readFileInfo(url.path) else { continue }
+        if info.symbolicLink { enumerator.skipDescendants() }
+        guard info.regular || (includingLinks && info.symbolicLink) else { continue }
         files[String(url.path.dropFirst(prefix.count))] = info
     }
     if let error = walkError { throw error }

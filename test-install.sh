@@ -7,11 +7,7 @@ pack="$fixture/package"
 mocks="$fixture/mocks"
 mkdir -p "$pack/WeChatFileSync.app/Contents/MacOS" "$mocks"
 cp "$root/Install.command" "$root/Uninstall.command" "$pack/"
-cat > "$pack/WeChatFileSync.app/Contents/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>io.github.coderhanxin.wechat-file-sync</string></dict></plist>
-PLIST
+cp "$root/Info.plist" "$pack/WeChatFileSync.app/Contents/Info.plist"
 cat > "$pack/WeChatFileSync.app/Contents/MacOS/WeChatFileSync" <<'MOCK'
 #!/bin/bash
 printf '%s\n' "$1" >> "$MOCK_HELPER_LOG"

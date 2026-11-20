@@ -2,7 +2,7 @@
 set -euo pipefail
 
 app="$HOME/Applications/WeChatFileSync.app"
-identifier="io.github.coderhanxin.wechat-file-sync"
+identifier="0xRock3.WechatFileSync"
 if [ -L "$HOME/Applications" ] || [ -L "$app" ]; then
     echo "应用或其父目录为符号链接，请自行处理。" >&2; exit 1
 fi

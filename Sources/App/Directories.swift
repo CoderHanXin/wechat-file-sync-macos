@@ -34,7 +34,7 @@ func showMessage(_ text: String) {
     alert.runModal()
 }
 
-func chooseDirectory(_ suggested: URL, title: String, message: String, requireMatch: Bool) throws -> URL {
+func directoryPanel(_ suggested: URL, title: String, message: String) -> NSOpenPanel {
     let panel = NSOpenPanel()
     panel.title = title
     panel.message = message
@@ -43,6 +43,11 @@ func chooseDirectory(_ suggested: URL, title: String, message: String, requireMa
     panel.canChooseDirectories = true
     panel.allowsMultipleSelection = false
     panel.directoryURL = suggested
+    return panel
+}
+
+func chooseDirectory(_ suggested: URL, title: String, message: String, requireMatch: Bool) throws -> URL {
+    let panel = directoryPanel(suggested, title: title, message: message)
     guard panel.runModal() == .OK, let selection = panel.url else {
         throw SyncError.message("未选择文件夹")
     }
@@ -102,32 +107,6 @@ func bookmarkScope(_ bookmark: Data) throws -> DirectoryLease {
     return DirectoryLease(url: selected) { selected.stopAccessingSecurityScopedResource() }
 }
 
-func selectWeChatRoot(suggested: URL? = nil) throws -> DirectoryLease {
-    activateConfigurationUI()
-    let selected = try chooseDirectory(try suggested ?? expectedWeChatRoot(), title: "选择微信文件夹",
-        message: "请选择 xwechat_files。下一步选择要同步的微信账号。", requireMatch: false)
-    guard selected.lastPathComponent == "xwechat_files", selected.startAccessingSecurityScopedResource() else {
-        throw SyncError.message("请选择并允许访问 xwechat_files 文件夹")
-    }
-    return DirectoryLease(url: selected) { selected.stopAccessingSecurityScopedResource() }
-}
-
-func chooseDiscoveredAccount(_ accounts: [DiscoveredAccount], registered: [Account]) throws -> DiscoveredAccount {
-    let available = accounts.filter { candidate in
-        !registered.contains { $0.source == candidate.source.path || $0.sourceIdentity == candidate.identity }
-    }
-    guard !available.isEmpty else {
-        throw SyncError.message("没有可添加的账号。只列出已初始化且可访问的账号；已添加或已停止管理的账号请在主界面选择。")
-    }
-    let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 360, height: 26))
-    available.forEach { picker.addItem(withTitle: $0.name) }
-    let alert = NSAlert(); alert.messageText = "选择微信账号"
-    alert.informativeText = "只管理你选择的账号。已有微信文件留在原处。"
-    alert.accessoryView = picker; alert.addButton(withTitle: "下一步"); alert.addButton(withTitle: "取消")
-    guard alert.runModal() == .alertFirstButtonReturn else { throw SyncError.message("已取消添加") }
-    return available[picker.indexOfSelectedItem]
-}
-
 func rootLease(_ repository: AccountRepository) throws -> DirectoryLease {
     guard let root = try repository.root() else { throw SyncError.message("请先运行 --configure 配置管理根目录") }
     return try securityScope(bookmark: root.bookmark, expected: root.url, identity: root.identity)
@@ -144,7 +123,7 @@ func recoverAccounts(_ repository: AccountRepository, accountID: String? = nil) 
             let source = try sourceScope(setup.account)
             defer { withExtendedLifetime(source) {} }
             try manager.recover(setup)
-        } catch let error as SQLiteStoreError { throw SyncError.persistence(error.description) }
+        } catch let error as SQLiteStoreError { throw SyncError.persistenceFailure(error) }
         catch {
             failures += 1
             NSLog("账号配置尚未恢复 %@：%@", setup.account.id, String(describing: error))

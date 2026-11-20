@@ -81,12 +81,17 @@ struct Observation {
 enum SyncError: Error, CustomStringConvertible {
     case message(String)
     case system(String, Int32)
-    case persistence(String)
+    case persistence(String, sqliteCode: Int32? = nil)
+
+    static func persistenceFailure(_ error: Error) -> SyncError {
+        if let error = error as? SyncError, case .persistence = error { return error }
+        return .persistence(String(describing: error), sqliteCode: (error as? SQLiteStoreError)?.code)
+    }
 
     var description: String {
         switch self {
         case .message(let text): return text
-        case .persistence(let text): return "状态保存失败：\(text)"
+        case .persistence(let text, _): return "状态保存失败：\(text)"
         case .system(let operation, let number):
             return "\(operation)：\(String(cString: strerror(number)))"
         }

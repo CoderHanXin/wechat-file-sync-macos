@@ -129,7 +129,7 @@ final class ContentRepository {
     func atomic(_ body: () throws -> Void) throws {
         guard !accounts.readOnly else { throw SyncError.persistence("只读连接不能修改内容状态") }
         do { try accounts.transaction(body: body) }
-        catch { throw SyncError.persistence(String(describing: error)) }
+        catch { throw SyncError.persistenceFailure(error) }
     }
 
     private func decode<T: Decodable>(_ type: T.Type, _ data: Data) throws -> T {

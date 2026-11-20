@@ -38,7 +38,7 @@ func runContentCommand(_ command: Command, store: ContentRepository) throws {
                    let moved = try index.find(entity.identity) { entity.relative = moved; try store.atomic { try store.put(entity) } }
                 try ReadOnlyPolicy(store: store).apply(entity, at: checkedFile(root.url, relative: entity.relative), protect: enabled)
                 print("权限已核对：\(entity.relative)")
-            } catch let error as SQLiteStoreError { throw SyncError.persistence(error.description) }
+            } catch let error as SQLiteStoreError { throw SyncError.persistenceFailure(error) }
             catch let error as SyncError {
                 if case .persistence = error { throw error }
                 failures += 1; print("权限未完成：\(entity.relative)：\(error)")
