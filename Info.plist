@@ -5,6 +5,7 @@
     <key>CFBundleDisplayName</key><string>微信文件同步</string>
     <key>CFBundleName</key><string>微信文件同步</string>
     <key>CFBundleIdentifier</key><string>0xRock3.WechatFileSync</string>
+    <key>CFBundleIconFile</key><string>AppIcon.icns</string>
     <key>CFBundleExecutable</key><string>WeChatFileSync</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.6.2</string>

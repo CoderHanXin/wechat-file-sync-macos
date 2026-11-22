@@ -16,7 +16,7 @@ release="$build/WeChatFileSync-v$version"
 app="$release/WeChatFileSync.app"
 mkdir -p "$build/module-cache" "$dist"
 rm -rf "$release"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 sources=("$root"/Sources/Core/*.swift "$root"/Sources/App/*.swift)
 for arch in arm64 x86_64; do
@@ -26,6 +26,7 @@ done
 xcrun lipo -create "$build/WeChatFileSync-arm64" "$build/WeChatFileSync-x86_64" \
     -output "$app/Contents/MacOS/WeChatFileSync"
 cp "$root/Info.plist" "$app/Contents/Info.plist"
+cp "$root/Resources/AppIcon.icns" "$root/Resources/MenuBarIcon.pdf" "$app/Contents/Resources/"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $numeric_version" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $numeric_version" "$app/Contents/Info.plist"
 codesign --force --sign - --entitlements "$root/entitlements.plist" "$app"

@@ -221,7 +221,11 @@ fileprivate final class DesktopController: NSObject, NSApplicationDelegate, NSWi
 
     fileprivate func makeMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "tray.and.arrow.down", accessibilityDescription: "微信文件同步")
+        let icon = Bundle.main.url(forResource: "MenuBarIcon", withExtension: "pdf").flatMap { NSImage(contentsOf: $0) }
+            ?? NSImage(systemSymbolName: "tray.and.arrow.down", accessibilityDescription: nil)
+        icon?.isTemplate = true
+        icon?.accessibilityDescription = "微信文件同步"
+        statusItem.button?.image = icon
         let menu = NSMenu()
         menu.autoenablesItems = false
         menuStatus.isEnabled = false; menu.addItem(menuStatus)
@@ -1436,6 +1440,10 @@ fileprivate extension DesktopController {
     func reviewMenuStatus() {
         let good = snapshot!
         let menu = statusItem.menu!
+        precondition(statusItem.button?.image?.isTemplate == true)
+        if Bundle.main.url(forResource: "MenuBarIcon", withExtension: "pdf") != nil {
+            precondition(statusItem.button?.image?.size == NSSize(width: 19, height: 19))
+        }
         precondition(menu.items.first === menuStatus && !menuStatus.isEnabled)
         let unconfigured = ApplicationSnapshot(root: nil, canChooseRoot: true, accounts: [], readOnly: [:], recoverable: [:], message: "请添加微信账号")
         render(unconfigured, error: nil)

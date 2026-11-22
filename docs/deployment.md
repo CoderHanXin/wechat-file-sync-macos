@@ -1,6 +1,6 @@
 # 构建、安装与部署
 
-当前本地测试包为 `0.6.9-test`。历次构建、隔离测试和真机验证见 [验收记录](validation-report.md)。
+历次构建、隔离测试和真机验证见 [验收记录](validation-report.md)。
 
 ## 构建
 
@@ -8,11 +8,11 @@
 
 ```sh
 bash test.sh
-bash build.sh 0.6.9-test
+bash build.sh 0.6.10-test
 bash test-install.sh
 ```
 
-输出 `dist/WeChatFileSync-v0.6.9-test-macOS.zip` 和同名 `.sha256` 文件，包含通用 `WeChatFileSync.app`、安装与卸载脚本、许可证和文档。目标 macOS 13+，ARM64／x86_64。当前为 ad-hoc 本地签名，Intel 实机验证、公证和下载后首次启动兼容性分别验收。
+此例输出 `dist/WeChatFileSync-v0.6.10-test-macOS.zip` 和同名 `.sha256` 文件，包含通用 `WeChatFileSync.app`、安装与卸载脚本、许可证和文档。目标 macOS 13+，ARM64／x86_64。当前为 ad-hoc 本地签名，Intel 实机验证、公证和下载后首次启动兼容性分别验收。
 
 `bash test-desktop.sh` 另编译 `DESKTOP_TESTING` 图形夹具，仅临时假账号，不启动真实 worker。需要可连接 WindowServer 的图形会话；没有既有屏幕录制权限时不请求权限，保存文字 PDF 并检查结构，完整原生控件外观另行人工验证。生产包不包含测试入口。人工查看布局可用 `bash test-desktop.sh --manual`；它只保留假账号窗口，禁用业务和登录项动作，详见用户指南。
 
@@ -28,7 +28,7 @@ bash test-install.sh
 
 ### 更换应用标识
 
-如果已安装使用 `io.github.coderhanxin.wechat-file-sync` 的测试版（例如 0.6.8-test），先退出旧版并运行旧版安装包里的 `Uninstall.command`，再运行 0.6.9-test 的安装脚本。旧版卸载脚本会处理旧登录项。
+如果已安装使用 `io.github.coderhanxin.wechat-file-sync` 的测试版（例如 0.6.8-test），先退出旧版并运行旧版安装包里的 `Uninstall.command`，再运行使用新标识的安装脚本。旧版卸载脚本会处理旧登录项。
 
 新版在自己的沙盒容器中创建配置。重新选择微信账号和保存位置后，只跟踪新建立的文件关联。此前归档和微信链接留在原位置；如果保存位置里已有同名归档文件夹，新账号会另选可用文件夹。
 
