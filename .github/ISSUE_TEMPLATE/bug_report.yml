@@ -1,0 +1,44 @@
+name: 报告问题
+description: 反馈安装、设置、文件同步或其他使用问题
+body:
+  - type: markdown
+    attributes:
+      value: |
+        问题会公开显示。请隐去微信账号、聊天内容和包含个人信息的文件名或路径。
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: 版本信息
+      description: 应用版本可在「设置 → 通用」查看。暂时查不到的版本可填「不清楚」。
+      placeholder: |
+        微信文件同步：
+        macOS：
+        Mac 版微信：
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从哪一步开始？依次做了什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: result
+    attributes:
+      label: 预期和实际结果
+      description: 你原本预期发生什么？实际发生了什么？如有错误提示，可附文字或脱敏截图。
+    validations:
+      required: true
+
+  - type: textarea
+    id: sync-status
+    attributes:
+      label: 同步状态
+      description: 遇到文件同步问题时请填写。
+      placeholder: |
+        微信里是否已经点击「接收文件」：
+        菜单栏当时显示的状态：
